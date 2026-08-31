@@ -1,6 +1,13 @@
-master_channel: blueset.telegram
-slave_channels:
-- honus.comwechat
-middlewares:
-- QQ_War.keyword_reply
-- QQ_War.message_merge
+core:
+  base_url: http://127.0.0.1:8080
+  timeout: 10
+  poll_timeout: 15
+  verify_tls: true
+
+# Empty means all Core accounts. To isolate one EFB instance, list explicit IDs.
+account_ids: []
+
+consumer_id: efb-linux-wechat
+poll_interval: 1.0
+event_limit: 50
+startup_healthcheck: true

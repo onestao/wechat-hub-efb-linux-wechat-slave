@@ -1,8 +1,10 @@
 .history/
-tset.py
-build/*
-dist/*
-*.egg-info
-test*
-__pycache__*
-task
+.venv-c/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/

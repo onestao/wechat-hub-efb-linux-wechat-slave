@@ -1,40 +1,27 @@
-FROM python:alpine AS venv
+FROM python:3.10-slim
 
-RUN set -ex; \
-    apk --update upgrade; \
-    apk --update add --no-cache python3-dev py3-pillow py3-ruamel.yaml libmagic ffmpeg git gcc zlib-dev jpeg-dev musl-dev libffi-dev openssl-dev libwebp-dev
-RUN python -m venv --copies /app/venv; \
-    . /app/venv/bin/activate; \
-    pip3 install git+https://github.com/QQ-War/efb-telegram-master.git; \
-    pip3 install ehforwarderbot python-telegram-bot; \
-    pip3 install git+https://github.com/0honus0/python-comwechatrobot-http.git; \
-    pip3 install git+https://github.com/0honus0/efb-wechat-comwechat-slave.git; \
-    pip3 install git+https://github.com/QQ-War/efb-keyword-reply.git; \
-    pip3 install git+https://github.com/QQ-War/efb_message_merge.git; \
-    pip3 install urllib3==1.26.15; \
-    pip3 install --no-deps --force-reinstall Pillow; \
-    pip3 install --ignore-installed PyYAML TgCrypto
-    
-FROM python:alpine AS prod
+ARG KETTLY_ETM_REPO=https://github.com/kettly1260/efb-telegram-master.git
+ARG KETTLY_ETM_REF=36b3382ed784efeba176dba269df47d4df0ef4e7
 
-LABEL org.opencontainers.image.source https://github.com/0honus0/efb-wechat-comwechat-slave
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONUTF8=1
 
-ENV LANG C.UTF-8
-ENV TZ Asia/Shanghai
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential ffmpeg git libmagic1 \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY --from=venv /app/venv /app/venv/
-ENV PATH /app/venv/bin:$PATH
+# The image deliberately installs the selected Kettly fork from source at the
+# workspace-locked revision. It never substitutes PyPI efb-telegram-master.
+RUN git clone "${KETTLY_ETM_REPO}" /opt/efb-telegram-master \
+    && git -C /opt/efb-telegram-master checkout "${KETTLY_ETM_REF}" \
+    && python -m pip install --no-cache-dir -e /opt/efb-telegram-master
 
-COPY config-example.yaml /root/.ehforwarderbot/profiles/default/config.yaml
+COPY . /opt/efb-linux-wechat-slave
+RUN python -m pip install --no-cache-dir -e /opt/efb-linux-wechat-slave
 
-RUN set -ex; \
-    apk --update upgrade; \
-    apk --update add --no-cache tzdata libmagic ffmpeg; \
-    rm -rf /tmp/* /var/cache/apk/* /var/lib/apk/lists/*; \
-    ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime; \
-    echo "Asia/Shanghai" > /etc/timezone; \
-    mkdir -p /root/.ehforwarderbot/profiles/default/blueset.telegram /root/.ehforwarderbot/modules/
-
-VOLUME /root/.ehforwarderbot/profiles/default/blueset.telegram
+WORKDIR /opt/efb-linux-wechat-slave
+VOLUME ["/root/.ehforwarderbot"]
 
 ENTRYPOINT ["ehforwarderbot"]
+CMD ["-p", "default"]
