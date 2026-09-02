@@ -13,6 +13,9 @@ The implementation also uses legacy `efb-wechat-slave` as the Telegram UX compat
 - Core media is downloaded through `/v1/media/{media_id}`;
 - text/image/file sends use `/v1/send/*` with idempotency keys;
 - EFB reply targets map to Core `target_message_id`;
+- when Core advertises that its concrete sender has no verified native reply,
+  text replies fall back to the old-EWS visible quote instead of entering a
+  doomed outbox request;
 - Core `message.removed` maps to EFB `MessageRemoval`;
 - active channel state is per instance, not class-global.
 
@@ -81,6 +84,11 @@ has been removed.
 - Core V1 has no chat/member avatar endpoint, so EFB avatar requests are explicitly unsupported.
 - Core V1 has no outgoing recall endpoint. Incoming WeChat recalls are forwarded to Telegram, but Telegram-initiated recall is explicitly unsupported.
 - A successful `/v1/send/*` response means Core accepted the send into its outbox; it is not proof of WeChat delivery.
+- Optional Core `sender_capabilities` are honored when present. Unsupported
+  arbitrary-file sends, non-text replies that cannot preserve target semantics,
+  and unsupported image captions are rejected before they are queued. An
+  absent capability field remains "unknown" for compatibility with other V1
+  Core implementations.
 
 ## Development checks
 

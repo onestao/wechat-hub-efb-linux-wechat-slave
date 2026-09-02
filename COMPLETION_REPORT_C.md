@@ -10,6 +10,14 @@ Session C has converted the locked ComWechat EFB slave source into a Linux/Core-
 
 Development integration verification passes against the workspace Mock Core and the **real local editable Kettly ETM source tree**. This is not claimed as a live WeChat + live Telegram end-to-end test.
 
+Post-integration review also added optional V1 sender-capability handling. When
+the connected production Core truthfully advertises that its current X11
+sender lacks native reply or arbitrary-file primitives, C no longer queues a
+request that is known to fail later: text replies use the retained old-EWS
+visible-quote fallback, while operations that cannot preserve semantics are
+rejected explicitly. Mock Core continues to advertise the full simulated V1
+surface so the original contract-routing tests remain covered.
+
 ## 2. Locked sources actually used
 
 | Source | Commit | Use |
@@ -55,7 +63,7 @@ The obsolete package-local Windows/Wine compose file was removed. The replacemen
 |---|---|
 | Branch | `feat/linux-wechat-slave` |
 | Python compile | PASS |
-| Unit + Mock Core + Kettly compatibility suite | **16 / 16 PASS** |
+| Unit + Mock Core + Kettly compatibility suite | **18 / 18 PASS** |
 | Multi-account `/link` cache path | PASS using real Kettly `ChatObjectCacheManager` |
 | Kettly reply target path | PASS using real `MasterMessageProcessor.attach_target_message()` |
 | Text send/reply | PASS against Mock Core |

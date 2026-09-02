@@ -96,6 +96,8 @@ class LinuxWeChatChannel(SlaveChannel):
         self.account_filter: Set[str] = {
             str(item) for item in self.config.get("account_ids", []) if str(item)
         }
+        self.sender_capabilities: Dict[str, Any] = {}
+        self.account_sender_capabilities: Dict[str, Dict[str, Any]] = {}
         consumer_base = str(self.config.get("consumer_id") or "efb-linux-wechat")
         self.consumer_id = f"{consumer_base}:{self.channel_id}"
 
@@ -111,7 +113,7 @@ class LinuxWeChatChannel(SlaveChannel):
 
         if bool(self.config.get("startup_healthcheck", True)):
             try:
-                self.core.health()
+                self._health()
             except CoreContractError:
                 raise
             except CoreUnavailableError as exc:
@@ -124,6 +126,13 @@ class LinuxWeChatChannel(SlaveChannel):
             getattr(self.core, "base_url", "injected"),
             sorted(self.account_filter) or "all",
         )
+
+    def _health(self) -> Dict[str, Any]:
+        payload = self.core.health()
+        capabilities = payload.get("sender_capabilities")
+        if isinstance(capabilities, Mapping):
+            self.sender_capabilities = dict(capabilities)
+        return payload
 
     @staticmethod
     def _merge_config(raw: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -171,8 +180,23 @@ class LinuxWeChatChannel(SlaveChannel):
                 continue
             display_name = str(account.get("display_name") or account_id)
             self.chat_mgr.set_account_name(account_id, display_name)
+            runtime = account.get("runtime") if isinstance(account.get("runtime"), Mapping) else {}
+            capabilities = runtime.get("sender_capabilities") if isinstance(runtime, Mapping) else None
+            if isinstance(capabilities, Mapping):
+                self.account_sender_capabilities[account_id] = dict(capabilities)
             selected.append(account)
         return selected
+
+    def _sender_capabilities_for(self, account_id: str) -> Dict[str, Any]:
+        capabilities = self.account_sender_capabilities.get(account_id)
+        if capabilities is not None:
+            return dict(capabilities)
+        try:
+            self._selected_accounts()
+        except CoreError:
+            pass
+        capabilities = self.account_sender_capabilities.get(account_id)
+        return dict(capabilities if capabilities is not None else self.sender_capabilities)
 
     def _resolve_core_chat(self, account_id: str, chat_id: str) -> Chat:
         cached = self.chat_mgr.get_by_core(account_id, chat_id)
@@ -192,7 +216,7 @@ class LinuxWeChatChannel(SlaveChannel):
 
     def get_chats(self) -> Collection[Chat]:
         try:
-            self.core.health()
+            self._health()
             result = []
             for account in self._selected_accounts():
                 account_id = str(account["account_id"])
@@ -284,7 +308,13 @@ class LinuxWeChatChannel(SlaveChannel):
         prefix = f"@{author_name}：" if author_name else ""
         return f"「{prefix}{target_text}」\n---\n{text}"
 
-    def _send_target_id(self, msg: Message, account_id: str, chat_id: str) -> Tuple[Optional[str], bool]:
+    def _send_target_id(
+        self,
+        msg: Message,
+        account_id: str,
+        chat_id: str,
+        capabilities: Mapping[str, Any],
+    ) -> Tuple[Optional[str], bool]:
         if not isinstance(msg.target, Message) or not msg.target.uid or not msg.target.chat:
             return None, False
         try:
@@ -299,10 +329,20 @@ class LinuxWeChatChannel(SlaveChannel):
             # echo_message_id yet. Sending send_id as target_message_id would
             # be invalid, so retain old-EWS visible quote behaviour for now.
             return None, True
+        if capabilities.get("native_reply") is False:
+            return None, True
         return translated, False
 
-    def _base_send_payload(self, msg: Message, account_id: str, chat_id: str) -> Tuple[Dict[str, Any], str, bool]:
-        target_message_id, quote_fallback = self._send_target_id(msg, account_id, chat_id)
+    def _base_send_payload(
+        self,
+        msg: Message,
+        account_id: str,
+        chat_id: str,
+        capabilities: Mapping[str, Any],
+    ) -> Tuple[Dict[str, Any], str, bool]:
+        target_message_id, quote_fallback = self._send_target_id(
+            msg, account_id, chat_id, capabilities
+        )
         core_vendor = msg.vendor_specific.get("core", {}) if isinstance(msg.vendor_specific, dict) else {}
         request_id = str(core_vendor.get("client_request_id") or msg.uid or uuid.uuid4().hex)
         payload: Dict[str, Any] = {
@@ -324,7 +364,14 @@ class LinuxWeChatChannel(SlaveChannel):
         if self.account_filter and account_id not in self.account_filter:
             raise EFBChatNotFound(f"Account is not enabled for this slave: {account_id}")
 
-        payload, request_id, quote_fallback = self._base_send_payload(msg, account_id, chat_id)
+        capabilities = self._sender_capabilities_for(account_id)
+        payload, request_id, quote_fallback = self._base_send_payload(
+            msg, account_id, chat_id, capabilities
+        )
+        if quote_fallback and msg.type not in {MsgType.Text, MsgType.Link}:
+            raise EFBOperationNotSupported(
+                "The connected Core sender cannot safely preserve reply semantics for this non-text message"
+            )
         try:
             if msg.type in {MsgType.Text, MsgType.Link}:
                 text = msg.text if msg.type == MsgType.Text else self._link_text(msg)
@@ -335,9 +382,22 @@ class LinuxWeChatChannel(SlaveChannel):
                 payload["text"] = text
                 mentions = list(self._mention_member_ids(msg))
                 if mentions:
+                    raw_limit = capabilities.get("max_mentions")
+                    try:
+                        mention_limit = int(raw_limit)
+                    except (TypeError, ValueError):
+                        mention_limit = 0
+                    if mention_limit > 0 and len(mentions) > mention_limit:
+                        raise EFBOperationNotSupported(
+                            f"The connected Core sender supports at most {mention_limit} verified mention(s) per send"
+                        )
                     payload["mention_member_ids"] = mentions
                 receipt = self.core.send_text(payload, request_id)
             elif msg.type in {MsgType.Image, MsgType.Sticker, MsgType.Animation}:
+                if msg.text and capabilities.get("media_caption") is False:
+                    raise EFBOperationNotSupported(
+                        "The connected Core sender cannot currently preserve image captions"
+                    )
                 content = self._read_message_file(msg)
                 payload["content_base64"] = base64.b64encode(content).decode("ascii")
                 filename = msg.filename or (Path(msg.path).name if msg.path else "image")
@@ -347,6 +407,10 @@ class LinuxWeChatChannel(SlaveChannel):
                     payload["caption"] = msg.text
                 receipt = self.core.send_image(payload, request_id)
             elif msg.type in {MsgType.File, MsgType.Video, MsgType.Voice}:
+                if capabilities.get("file") is False:
+                    raise EFBOperationNotSupported(
+                        "The connected Core sender does not currently provide a verified arbitrary-file send primitive"
+                    )
                 content = self._read_message_file(msg)
                 payload["content_base64"] = base64.b64encode(content).decode("ascii")
                 filename = msg.filename or (Path(msg.path).name if msg.path else "attachment")
@@ -453,6 +517,32 @@ class LinuxWeChatChannel(SlaveChannel):
         echo_message_id = str(receipt.get("echo_message_id") or "")
         if send_id and echo_message_id:
             self.echo_store.link(send_id, echo_message_id)
+        status = str(receipt.get("status") or "")
+        if status == "submitted":
+            # Do not present upstream FSM success as confirmed delivery.  The
+            # final WeChat/Core identity is only known after the DB echo is
+            # uniquely reconciled.
+            self.logger.info(
+                "Core send %s 已提交、等待微信确认 (delivery_certainty=%s)",
+                send_id or "<unknown>",
+                str(receipt.get("delivery_certainty") or "pending_confirmation"),
+            )
+        elif status == "sent":
+            self.logger.info(
+                "Core send %s 已由微信确认 (echo_message_id=%s)",
+                send_id or "<unknown>",
+                echo_message_id or "<unknown>",
+            )
+        elif status == "uncertain":
+            error = payload.get("error") if isinstance(payload.get("error"), Mapping) else {}
+            details = payload.get("details") if isinstance(payload.get("details"), Mapping) else {}
+            self.logger.warning(
+                "Core delivery certainty is unknown for send %s [%s]: %s details=%r",
+                send_id or "<unknown>",
+                str(error.get("code") or "agent_wechat_delivery_unknown"),
+                str(error.get("message") or "upstream response was not received"),
+                dict(details),
+            )
 
     def _handle_event(self, event: Mapping[str, Any]) -> None:
         event_type = str(event.get("event_type") or "")
@@ -506,7 +596,7 @@ class LinuxWeChatChannel(SlaveChannel):
 
     def poll_once(self) -> int:
         """Process one Core event page. Exposed for deterministic integration tests."""
-        self.core.health()
+        self._health()
         cursor = self.cursor_store.load()
         single_account = next(iter(self.account_filter)) if len(self.account_filter) == 1 else None
         page = self.core.poll_events(

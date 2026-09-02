@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import copy
 import tempfile
 import threading
 import unittest
@@ -105,6 +106,100 @@ class MockCoreChannelIntegrationTest(unittest.TestCase):
         self.assertEqual("reply", request["text"])
         self.assertTrue(sent.uid)
 
+    def test_sender_capability_falls_back_from_native_reply(self):
+        chat = self._chat("account-alpha", "alpha-private-1")
+        self.channel.sender_capabilities["native_reply"] = False
+        target = Message(chat=chat, uid="alpha-msg-1", type=MsgType.Text, text="old text")
+        outgoing = Message(chat=chat, type=MsgType.Text, text="reply", target=target)
+        self.channel.send_message(outgoing)
+        request = self.state.sends[-1]["request"]
+        self.assertNotIn("target_message_id", request)
+        self.assertIn("old text", request["text"])
+        self.assertIn("reply", request["text"])
+
+    def test_sender_capability_rejects_unexecutable_file_before_core_queue(self):
+        chat = self._chat("account-alpha", "alpha-private-1")
+        self.channel.sender_capabilities["file"] = False
+        before = len(self.state.sends)
+        attachment = Message(
+            chat=chat,
+            type=MsgType.File,
+            file=io.BytesIO(b"hello-file"),
+            filename="hello.txt",
+            mime="text/plain",
+        )
+        with self.assertRaises(EFBOperationNotSupported):
+            self.channel.send_message(attachment)
+        self.assertEqual(before, len(self.state.sends))
+
+    def test_file_capability_is_account_scoped_for_mixed_runtime_providers(self):
+        alpha = self.state.account("account-alpha")
+        beta = self.state.account("account-beta")
+        original_alpha = copy.deepcopy(alpha["runtime"])
+        original_beta = copy.deepcopy(beta["runtime"])
+        try:
+            alpha["runtime"].update(
+                {
+                    "runtime_provider": "agent_wechat",
+                    "sender_capabilities": {
+                        "text": True,
+                        "image": True,
+                        "file": True,
+                        "native_reply": False,
+                        "media_caption": False,
+                        "max_mentions": 0,
+                        "echo_confirmation": False,
+                        "verified_chat_target": True,
+                        "driver": "agent_wechat",
+                    },
+                }
+            )
+            beta["runtime"].update(
+                {
+                    "runtime_provider": "legacy",
+                    "sender_capabilities": {
+                        "text": False,
+                        "image": False,
+                        "file": False,
+                        "native_reply": False,
+                        "media_caption": False,
+                        "max_mentions": 0,
+                        "echo_confirmation": False,
+                        "verified_chat_target": False,
+                        "driver": "legacy",
+                    },
+                }
+            )
+            self.channel.account_sender_capabilities.clear()
+            alpha_chat = self._chat("account-alpha", "alpha-private-1")
+            beta_chat = self._chat("account-beta", "beta-private-1")
+
+            alpha_file = Message(
+                chat=alpha_chat,
+                type=MsgType.File,
+                file=io.BytesIO(b"agent-file"),
+                filename="agent.txt",
+                mime="text/plain",
+            )
+            self.channel.send_message(alpha_file)
+            self.assertEqual("account-alpha", self.state.sends[-1]["request"]["account_id"])
+
+            before = len(self.state.sends)
+            beta_file = Message(
+                chat=beta_chat,
+                type=MsgType.File,
+                file=io.BytesIO(b"legacy-file"),
+                filename="legacy.txt",
+                mime="text/plain",
+            )
+            with self.assertRaises(EFBOperationNotSupported):
+                self.channel.send_message(beta_file)
+            self.assertEqual(before, len(self.state.sends))
+        finally:
+            alpha["runtime"] = original_alpha
+            beta["runtime"] = original_beta
+            self.channel.account_sender_capabilities.clear()
+
     def test_send_updated_reconciles_echo_reply_recall_and_restart(self):
         chat = self._chat("account-alpha", "alpha-private-1")
         outgoing = Message(chat=chat, type=MsgType.Text, text="outgoing")
@@ -112,9 +207,21 @@ class MockCoreChannelIntegrationTest(unittest.TestCase):
         send_id = str(sent.uid)
         self.assertTrue(send_id.startswith("send-"))
 
-        self.channel._handle_send_update(
-            {"send_id": send_id, "echo_message_id": "alpha-outgoing-echo-1", "status": "sent"}
-        )
+        with self.assertLogs(self.channel.logger, level="INFO") as submitted_logs:
+            self.channel._handle_send_update(
+                {
+                    "send_id": send_id,
+                    "status": "submitted",
+                    "delivery_certainty": "pending_confirmation",
+                }
+            )
+        self.assertTrue(any("已提交、等待微信确认" in line for line in submitted_logs.output))
+
+        with self.assertLogs(self.channel.logger, level="INFO") as sent_logs:
+            self.channel._handle_send_update(
+                {"send_id": send_id, "echo_message_id": "alpha-outgoing-echo-1", "status": "sent"}
+            )
+        self.assertTrue(any("已由微信确认" in line for line in sent_logs.output))
         self.assertEqual("alpha-outgoing-echo-1", self.channel.echo_store.linked_echo(send_id))
 
         reply = Message(
