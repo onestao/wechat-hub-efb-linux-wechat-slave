@@ -1,5 +1,12 @@
 FROM python:3.10-slim
 
+ARG OCI_REVISION=""
+ARG OCI_VERSION=""
+
+LABEL org.opencontainers.image.source="https://github.com/onestao/wechat-hub-efb-linux-wechat-slave"
+LABEL org.opencontainers.image.revision="${OCI_REVISION}"
+LABEL org.opencontainers.image.version="${OCI_VERSION}"
+
 ARG KETTLY_ETM_REPO=https://github.com/kettly1260/efb-telegram-master.git
 ARG KETTLY_ETM_REF=36b3382ed784efeba176dba269df47d4df0ef4e7
 
