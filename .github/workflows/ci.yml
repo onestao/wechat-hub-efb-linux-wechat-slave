@@ -22,7 +22,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install setuptools -r requirements.txt
+          python -m pip install "setuptools<70" -r requirements.txt
 
       - name: Run EFB tests
         run: python -m unittest tests.test_uid -v
