@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import os
+import subprocess
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+
+LOCKED_KETTLY_COMMIT = "36b3382ed784efeba176dba269df47d4df0ef4e7"
 
 import efb_telegram_master
 from ehforwarderbot import Message, MsgType, coordinator
@@ -20,11 +24,16 @@ from efb_wechat_comwechat_slave.Core import CoreClient
 from efb_wechat_comwechat_slave.UID import decode_chat_uid
 
 
+LOCAL_MOCK_APP = Path(__file__).resolve().parent / "mock_core.py"
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+STACK_MOCK_APP = PROJECT_ROOT / "stack" / "mock-core" / "app.py"
+MOCK_APP = LOCAL_MOCK_APP if LOCAL_MOCK_APP.is_file() else STACK_MOCK_APP
+
+
 def load_mock_core_module():
-    path = Path(__file__).resolve().parents[3] / "stack" / "mock-core" / "app.py"
-    spec = importlib.util.spec_from_file_location("wechat_hub_mock_core_for_kettly", path)
+    spec = importlib.util.spec_from_file_location("wechat_hub_mock_core_for_kettly", MOCK_APP)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"Unable to load Mock Core: {path}")
+        raise RuntimeError(f"Unable to load Mock Core: {MOCK_APP}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -71,8 +80,34 @@ class KettlyETMCompatibilityTest(unittest.TestCase):
 
     def test_etm_is_loaded_from_locked_editable_source(self):
         etm_path = Path(efb_telegram_master.__file__).resolve()
-        expected_root = Path(__file__).resolve().parents[3] / "upstream" / "efb-telegram-master-kettly"
-        self.assertTrue(etm_path.is_relative_to(expected_root.resolve()), (etm_path, expected_root))
+        env_root = os.environ.get("EFB_KETTLY_ROOT")
+        default_root = Path(__file__).resolve().parents[3] / "upstream" / "efb-telegram-master-kettly"
+        expected_root = Path(env_root).resolve() if env_root else (default_root.resolve() if default_root.is_dir() else None)
+
+        if expected_root is not None:
+            self.assertTrue(etm_path.is_relative_to(expected_root), f"{etm_path} is not relative to {expected_root}")
+            repo_dir = expected_root
+        else:
+            repo_dir = None
+            for parent in [etm_path.parent, etm_path.parent.parent, etm_path.parent.parent.parent]:
+                if (parent / ".git").is_dir():
+                    repo_dir = parent
+                    break
+            self.assertIsNotNone(repo_dir, f"Could not find git repository root for {etm_path}")
+
+        try:
+            commit = subprocess.check_output(
+                ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        except Exception as err:
+            self.fail(f"Failed to inspect git HEAD at {repo_dir}: {err}")
+        self.assertEqual(
+            LOCKED_KETTLY_COMMIT,
+            commit,
+            f"Loaded ETM commit {commit} does not match locked baseline {LOCKED_KETTLY_COMMIT}",
+        )
 
     def test_real_kettly_chat_cache_consumes_get_chats_used_by_link(self):
         # ChatObjectCacheManager is the real Kettly component that /link reads.

@@ -19,13 +19,24 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install dependencies
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg libmagic1
+
+      - name: Install dependencies and locked Kettly ETM
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "setuptools<70" -r requirements.txt
+          git clone https://github.com/kettly1260/efb-telegram-master.git /tmp/efb-telegram-master-kettly
+          git -C /tmp/efb-telegram-master-kettly checkout 36b3382ed784efeba176dba269df47d4df0ef4e7
+          python -m pip install "setuptools<70" "urllib3<2"
+          python -m pip install -e /tmp/efb-telegram-master-kettly
+          python -m pip install -e .
 
-      - name: Run EFB tests
-        run: python -m unittest tests.test_uid -v
+      - name: Run full EFB test suite
+        env:
+          EFB_KETTLY_ROOT: /tmp/efb-telegram-master-kettly
+        run: python -m unittest discover -s tests -v
 
       - name: Compile-check package
         run: python -m compileall -q efb_wechat_comwechat_slave
