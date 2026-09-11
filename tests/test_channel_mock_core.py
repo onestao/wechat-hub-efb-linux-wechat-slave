@@ -19,7 +19,15 @@ from efb_wechat_comwechat_slave.UID import decode_chat_uid
 
 
 def load_mock_core_module():
-    path = Path(__file__).resolve().parents[3] / "stack" / "mock-core" / "app.py"
+    cur = Path(__file__).resolve().parent
+    while cur.parent != cur:
+        candidate = cur / "stack" / "mock-core" / "app.py"
+        if candidate.exists():
+            path = candidate
+            break
+        cur = cur.parent
+    else:
+        path = Path(__file__).resolve().parents[3] / "stack" / "mock-core" / "app.py"
     spec = importlib.util.spec_from_file_location("wechat_hub_mock_core_for_c", path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Unable to load Mock Core: {path}")

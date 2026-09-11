@@ -183,6 +183,30 @@ class CoreClient:
             )
         )
 
+    def checkpoint_events(
+        self,
+        consumer_id: str,
+        processed_through_cursor: int,
+        *,
+        last_event_id: str = "",
+        subscription_account_id: str = "",
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "consumer_id": consumer_id,
+            "processed_through_cursor": int(processed_through_cursor),
+        }
+        if last_event_id:
+            payload["last_event_id"] = last_event_id
+        if subscription_account_id:
+            payload["subscription_account_id"] = subscription_account_id
+        return self._json(
+            self._request(
+                "POST",
+                "/v1/events/checkpoint",
+                json=payload,
+            )
+        )
+
     def get_media(self, account_id: str, media_id: str) -> CoreMedia:
         path = f"/v1/media/{quote(media_id, safe='')}"
         response = self._request("GET", path, params={"account_id": account_id})

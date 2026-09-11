@@ -626,6 +626,22 @@ class LinuxWeChatChannel(SlaveChannel):
                     # Contract states ack does not replace cursor persistence.
                     self.logger.warning("Core event ack failed after cursor persistence: %s", exc)
             processed += 1
+        has_more = bool(page.get("has_more"))
+        stream_head = page.get("stream_head_cursor")
+        current_cursor = self.cursor_store.load()
+        try:
+            cur_int = int(current_cursor or "0")
+        except ValueError:
+            cur_int = 0
+        checkpoint_cursor = cur_int if has_more else (int(stream_head) if stream_head is not None else cur_int)
+        try:
+            self.core.checkpoint_events(
+                self.consumer_id,
+                checkpoint_cursor,
+                subscription_account_id=single_account or "",
+            )
+        except Exception as exc:
+            self.logger.warning("Core event checkpoint failed after local processing: %s", exc)
         return processed
 
     def poll(self) -> None:
