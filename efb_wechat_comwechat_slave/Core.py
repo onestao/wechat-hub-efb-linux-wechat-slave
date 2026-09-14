@@ -207,6 +207,55 @@ class CoreClient:
             )
         )
 
+    def get_bootstrap_provenance(self, consumer_id: str) -> Optional[Dict[str, Any]]:
+        path = f"/v1/consumers/{quote(consumer_id, safe='')}/bootstrap"
+        try:
+            return self._json(self._request("GET", path))
+        except CoreAPIError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+
+    def bootstrap_consumer(
+        self,
+        consumer_id: str,
+        *,
+        mode: str = "at_head",
+        window: Optional[Mapping[str, Any]] = None,
+        operator_token: str = "",
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "consumer_id": consumer_id,
+            "mode": mode,
+        }
+        if window:
+            payload["window"] = dict(window)
+        if operator_token:
+            payload["operator_token"] = operator_token
+        return self._json(self._request("POST", "/v1/consumers/bootstrap", json=payload))
+
+    def rebootstrap_consumer(
+        self,
+        consumer_id: str,
+        *,
+        mode: str = "bounded_window",
+        window: Optional[Mapping[str, Any]] = None,
+        operator_token: str = "",
+        quiescence_evidence: str = "",
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "consumer_id": consumer_id,
+            "mode": mode,
+            "operator_token": operator_token,
+            "quiescence_evidence": quiescence_evidence,
+        }
+        if window:
+            payload["window"] = dict(window)
+        if reason:
+            payload["reason"] = reason
+        return self._json(self._request("POST", "/v1/consumers/rebootstrap", json=payload))
+
     def get_media(self, account_id: str, media_id: str) -> CoreMedia:
         path = f"/v1/media/{quote(media_id, safe='')}"
         response = self._request("GET", path, params={"account_id": account_id})
@@ -248,15 +297,18 @@ class CursorStore:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
 
-    def load(self) -> str:
+    def load(self, default: Optional[str] = None) -> Optional[str]:
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             cursor = payload.get("cursor") if isinstance(payload, dict) else None
-            return str(cursor) if cursor not in (None, "") else "0"
+            return str(cursor) if cursor not in (None, "") else default
         except FileNotFoundError:
-            return "0"
+            return default
         except (OSError, ValueError, TypeError):
-            return "0"
+            return default
+
+    def has_cursor(self) -> bool:
+        return self.load(default=None) is not None
 
     def save(self, cursor: str) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -270,6 +322,48 @@ class CursorStore:
         finally:
             if os.path.exists(temp_name):
                 os.unlink(temp_name)
+
+    def align_with_core(
+        self,
+        core: CoreClient,
+        consumer_id: str,
+        *,
+        default_mode: str = "at_head",
+        window: Optional[Mapping[str, Any]] = None,
+        operator_token: str = "",
+    ) -> str:
+        """Align local cursor with Core bootstrap state.
+
+        If the consumer is not bootstrapped in Core, executes governed bootstrap
+        using default_mode.
+        If local cursor is missing or regressed behind Core initial_cursor, advances
+        it to Core initial_cursor so full historical catchup from 0 is blocked.
+        """
+        local_cur_str = self.load(default=None)
+        try:
+            prov = core.get_bootstrap_provenance(consumer_id)
+        except (CoreAPIError, CoreUnavailableError):
+            prov = None
+
+        if prov is None:
+            try:
+                prov = core.bootstrap_consumer(
+                    consumer_id,
+                    mode=default_mode,
+                    window=window,
+                    operator_token=operator_token,
+                )
+            except (CoreAPIError, CoreUnavailableError):
+                prov = None
+
+        core_init = int(prov.get("initial_cursor") or 0) if prov is not None else 0
+        local_cur = int(local_cur_str) if local_cur_str is not None else None
+
+        if local_cur is None or local_cur < core_init:
+            effective = core_init
+            self.save(str(effective))
+            return str(effective)
+        return str(local_cur)
 
 
 class EchoStore:

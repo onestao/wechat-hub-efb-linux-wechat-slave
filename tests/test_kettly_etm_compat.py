@@ -21,7 +21,15 @@ from efb_wechat_comwechat_slave.UID import decode_chat_uid
 
 
 def load_mock_core_module():
-    path = Path(__file__).resolve().parents[3] / "stack" / "mock-core" / "app.py"
+    cur = Path(__file__).resolve().parent
+    while cur.parent != cur:
+        candidate = cur / "stack" / "mock-core" / "app.py"
+        if candidate.exists():
+            path = candidate
+            break
+        cur = cur.parent
+    else:
+        path = Path(__file__).resolve().parents[3] / "stack" / "mock-core" / "app.py"
     spec = importlib.util.spec_from_file_location("wechat_hub_mock_core_for_kettly", path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Unable to load Mock Core: {path}")
@@ -71,7 +79,15 @@ class KettlyETMCompatibilityTest(unittest.TestCase):
 
     def test_etm_is_loaded_from_locked_editable_source(self):
         etm_path = Path(efb_telegram_master.__file__).resolve()
-        expected_root = Path(__file__).resolve().parents[3] / "upstream" / "efb-telegram-master-kettly"
+        cur = Path(__file__).resolve().parent
+        while cur.parent != cur:
+            candidate = cur / "upstream" / "efb-telegram-master-kettly"
+            if candidate.exists():
+                expected_root = candidate
+                break
+            cur = cur.parent
+        else:
+            expected_root = Path(__file__).resolve().parents[3] / "upstream" / "efb-telegram-master-kettly"
         self.assertTrue(etm_path.is_relative_to(expected_root.resolve()), (etm_path, expected_root))
 
     def test_real_kettly_chat_cache_consumes_get_chats_used_by_link(self):

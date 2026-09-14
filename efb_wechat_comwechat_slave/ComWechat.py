@@ -37,6 +37,7 @@ from . import __version__ as version
 from .ChatMgr import ChatMgr
 from .Core import CoreAPIError, CoreClient, CoreContractError, CoreError, CoreUnavailableError, CursorStore, EchoStore
 from .CoreMessage import CoreMessageBuilder
+from .EffectLedger import EffectLedger
 from .UID import InvalidUID, decode_chat_uid
 
 
@@ -52,6 +53,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "poll_interval": 1.0,
     "event_limit": 50,
     "startup_healthcheck": True,
+    "bootstrap_mode": "at_head",
+    "startup_history_projection": False,
 }
 
 
@@ -110,6 +113,18 @@ class LinuxWeChatChannel(SlaveChannel):
         resolved_data_path = Path(data_path) if data_path is not None else efb_utils.get_data_path(self.channel_id)
         self.cursor_store = CursorStore(resolved_data_path / "core-event-cursor.json")
         self.echo_store = EchoStore(resolved_data_path / "core-send-echo.json")
+        self.effect_ledger = EffectLedger(resolved_data_path / "core-effect-ledger.sqlite3")
+        self.startup_history_projection = bool(self.config.get("startup_history_projection", False))
+
+        # Register graceful shutdown handlers
+        try:
+            import signal
+            if threading.current_thread() is threading.main_thread():
+                signal.signal(signal.SIGINT, self._sig_handler)
+                if hasattr(signal, "SIGTERM"):
+                    signal.signal(signal.SIGTERM, self._sig_handler)
+        except (ValueError, AttributeError):
+            pass
 
         if bool(self.config.get("startup_healthcheck", True)):
             try:
@@ -120,11 +135,29 @@ class LinuxWeChatChannel(SlaveChannel):
                 # Core may start after EFB. Polling retries without losing cursor.
                 self.logger.warning("Core is not reachable during channel startup: %s", exc)
 
+        try:
+            aligned_cursor = self._ensure_bootstrap_aligned()
+            self.logger.info("Cursor aligned with Core initial position: %s", aligned_cursor)
+        except Exception as exc:
+            self.logger.debug("Could not align cursor during init (will align before first poll): %s", exc)
+
         self.logger.info(
             "Linux WeChat Slave initialized: version=%s core=%s accounts=%s",
             self.__version__,
             getattr(self.core, "base_url", "injected"),
             sorted(self.account_filter) or "all",
+        )
+
+    def _sig_handler(self, signum: int, frame: Any) -> None:
+        self.logger.info("Received termination signal %s, initiating graceful shutdown < 2s...", signum)
+        self.stop_polling()
+
+    def _ensure_bootstrap_aligned(self) -> str:
+        """Align local cursor with Core initial_cursor before polling."""
+        return self.cursor_store.align_with_core(
+            self.core,
+            self.consumer_id,
+            default_mode=str(self.config.get("bootstrap_mode") or "at_head"),
         )
 
     def _health(self) -> Dict[str, Any]:
@@ -574,6 +607,18 @@ class LinuxWeChatChannel(SlaveChannel):
                     efb_message_id,
                 )
                 return
+            # Check effect ledger for message.created to guarantee at-most-once external side effect
+            effect_id = ""
+            if event_type == "message.created" and core_message_id:
+                effect_id = self.effect_ledger.compute_effect_id(account_id, core_message_id)
+                if self.effect_ledger.is_effect_delivered(self.consumer_id, effect_id):
+                    self.logger.info(
+                        "Suppressing duplicate delivery for effect %s (core_msg_id=%s) via effect ledger",
+                        effect_id,
+                        core_message_id,
+                    )
+                    return
+
             chat = self._resolve_core_chat(account_id, chat_id)
             efb_msg = self.message_builder.build(message, chat)
             if core_message_id:
@@ -582,6 +627,18 @@ class LinuxWeChatChannel(SlaveChannel):
                 efb_msg.target.uid = MessageID(self.echo_store.efb_message_id(str(efb_msg.target.uid)))
             efb_msg.edit = event_type == "message.updated"
             self._deliver_message(efb_msg)
+
+            # Record successfully delivered message.created in effect ledger
+            if event_type == "message.created" and effect_id:
+                self.effect_ledger.record_delivered(
+                    self.consumer_id,
+                    effect_id,
+                    account_id=account_id,
+                    message_id=core_message_id,
+                    efb_uid=str(efb_msg.uid),
+                    event_type=event_type,
+                    details={"chat_id": chat_id, "type": str(efb_msg.type)},
+                )
         elif event_type == "message.removed":
             self._emit_removal(account_id, payload)
         elif event_type == "chat.updated":
@@ -594,15 +651,33 @@ class LinuxWeChatChannel(SlaveChannel):
             # Contract explicitly requires future unknown event types to be tolerated.
             self.logger.warning("Ignoring unknown Core event type %r", event_type)
 
-    def poll_once(self) -> int:
+    def _flush_final_checkpoint(self) -> None:
+        """Flush final checkpoint to Core before exiting (Defect D3)."""
+        try:
+            current_cursor = self.cursor_store.load(default=None)
+            if current_cursor is not None:
+                cur_int = int(current_cursor)
+                self.core.checkpoint_events(
+                    self.consumer_id,
+                    cur_int,
+                    subscription_account_id=next(iter(self.account_filter), "") if len(self.account_filter) == 1 else "",
+                )
+                self.logger.info("Flushed final checkpoint %s on shutdown", cur_int)
+        except Exception as exc:
+            self.logger.debug("Final checkpoint flush on shutdown skipped/failed: %s", exc)
+
+    def poll_once(self, poll_timeout: Optional[int] = None) -> int:
         """Process one Core event page. Exposed for deterministic integration tests."""
         self._health()
-        cursor = self.cursor_store.load()
+        cursor = self.cursor_store.load(default=None)
+        if cursor is None:
+            cursor = self._ensure_bootstrap_aligned()
         single_account = next(iter(self.account_filter)) if len(self.account_filter) == 1 else None
+        effective_timeout = self.poll_timeout if poll_timeout is None else poll_timeout
         page = self.core.poll_events(
             after=cursor,
             consumer_id=self.consumer_id,
-            timeout=self.poll_timeout,
+            timeout=effective_timeout,
             limit=self.event_limit,
             account_id=single_account,
         )
@@ -628,7 +703,7 @@ class LinuxWeChatChannel(SlaveChannel):
             processed += 1
         has_more = bool(page.get("has_more"))
         stream_head = page.get("stream_head_cursor")
-        current_cursor = self.cursor_store.load()
+        current_cursor = self.cursor_store.load(default="0")
         try:
             cur_int = int(current_cursor or "0")
         except ValueError:
@@ -646,22 +721,36 @@ class LinuxWeChatChannel(SlaveChannel):
 
     def poll(self) -> None:
         backoff = self.poll_interval
-        while not self._stop_event.is_set():
-            try:
-                processed = self.poll_once()
-                backoff = self.poll_interval
-                if processed == 0:
-                    self._stop_event.wait(self.poll_interval)
-            except CoreContractError:
-                self.logger.exception("Core contract is incompatible; polling stopped")
-                raise
-            except Exception:
-                self.logger.exception("Core polling iteration failed; cursor retained for retry")
-                self._stop_event.wait(backoff)
-                backoff = min(max(backoff * 2, self.poll_interval), 30.0)
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    # Bound long-poll duration during loop to <= 1s so stop_event is checked
+                    # promptly, guaranteeing shutdown drain completes in < 2s (Defect D3).
+                    loop_timeout = min(self.poll_timeout, 1)
+                    processed = self.poll_once(poll_timeout=loop_timeout)
+                    backoff = self.poll_interval
+                    if processed == 0:
+                        self._stop_event.wait(self.poll_interval)
+                except CoreContractError:
+                    self.logger.exception("Core contract is incompatible; polling stopped")
+                    raise
+                except Exception as exc:
+                    if self._stop_event.is_set():
+                        self.logger.info("Polling loop cleanly terminated on stop event")
+                        break
+                    self.logger.exception("Core polling iteration failed; cursor retained for retry: %s", exc)
+                    self._stop_event.wait(backoff)
+                    backoff = min(max(backoff * 2, self.poll_interval), 30.0)
+        finally:
+            self._flush_final_checkpoint()
 
     def stop_polling(self) -> None:
         self._stop_event.set()
+        try:
+            if hasattr(self.core, "session") and self.core.session:
+                self.core.session.close()
+        except Exception:
+            pass
 
     @efb_utils.extra(name="Core status", desc="Show WeChat Core V1 health and configured account states.")
     def core_status(self, _: str = "") -> str:
