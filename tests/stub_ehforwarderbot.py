@@ -103,7 +103,9 @@ class Message:
         self.file = file
         self.filename = filename
         self.mime = mime
+        self.path = kwargs.get("path")
         self.attributes = None
+        self.substitutions = kwargs.get("substitutions")
         self.vendor_specific: Dict[str, Any] = vendor_specific or {}
 
 

@@ -53,6 +53,7 @@ from .ShutdownCoordinator import (
     ShutdownCoordinator,
     install_shutdown_coordinator,
 )
+from .MessageMapping import MessageMappingStore
 from .UID import InvalidUID, decode_chat_uid
 
 
@@ -153,6 +154,7 @@ class LinuxWeChatChannel(SlaveChannel):
         self.cursor_store = CursorStore(resolved_data_path / "core-event-cursor.json")
         self.echo_store = EchoStore(resolved_data_path / "core-send-echo.json")
         self.effect_ledger = EffectLedger(resolved_data_path / "core-effect-ledger.sqlite3")
+        self.message_mapping = MessageMappingStore(resolved_data_path / "core-message-mapping.sqlite3")
         reconciled = self.effect_ledger.reconcile_on_startup(self.consumer_id)
         if reconciled:
             self.logger.warning(
@@ -512,19 +514,33 @@ class LinuxWeChatChannel(SlaveChannel):
         chat_id: str,
         capabilities: Mapping[str, Any],
     ) -> Tuple[Optional[str], bool]:
-        if not isinstance(msg.target, Message) or not msg.target.uid or not msg.target.chat:
+        if not isinstance(msg.target, Message):
             return None, False
+        if not msg.target.chat:
+            raise EFBMessageError("Reply target has no chat identity; refusing an unscoped reply")
         try:
             target_account, target_chat = decode_chat_uid(str(msg.target.chat.uid))
-        except InvalidUID:
-            return None, True
+        except InvalidUID as exc:
+            raise EFBMessageError("Reply target has an invalid chat identity") from exc
         if target_account != account_id or target_chat != chat_id:
+            raise EFBMessageError(
+                "Reply target belongs to a different account/chat; refusing cross-conversation delivery"
+            )
+        if not msg.target.uid:
             return None, True
-        translated = self.echo_store.core_message_id(str(msg.target.uid))
-        if translated is None:
-            # ETM has a Core send_id, but Core has not reported the final
-            # echo_message_id yet. Sending send_id as target_message_id would
-            # be invalid, so retain old-EWS visible quote behaviour for now.
+        target_uid = str(msg.target.uid)
+        mapping = self.message_mapping.resolve_target(
+            self.consumer_id,
+            account_id,
+            chat_id,
+            target_uid,
+        )
+        translated = str(mapping.get("core_message_id") or "") if mapping else ""
+        if not translated:
+            # Outgoing Telegram-originated messages retain their send_id in
+            # Kettly until Core reports a final echo message identity.
+            translated = str(self.echo_store.linked_echo(target_uid) or "")
+        if not translated:
             return None, True
         if capabilities.get("native_reply") is False:
             return None, True
@@ -639,6 +655,18 @@ class LinuxWeChatChannel(SlaveChannel):
                 self.echo_store.link(send_id, echo_message_id)
             else:
                 self.echo_store.mark_pending(send_id, request_id)
+        telegram_chat_id, telegram_message_id = self._telegram_message_ids(msg)
+        self.message_mapping.record(
+            self.consumer_id,
+            account_id,
+            chat_id,
+            str(msg.uid),
+            core_message_id=echo_message_id,
+            telegram_chat_id=telegram_chat_id,
+            telegram_message_id=telegram_message_id,
+            direction="outgoing",
+            sender_identity=account_id,
+        )
         self._remember_message(msg)
         return msg
 
@@ -708,12 +736,31 @@ class LinuxWeChatChannel(SlaveChannel):
             else:
                 coordinator.send_status(ChatUpdates(channel=self, modified_chats=(chat.uid,)))
 
-    def _handle_send_update(self, payload: Mapping[str, Any]) -> None:
+    @staticmethod
+    def _telegram_message_ids(msg: Message) -> Tuple[str, str]:
+        vendor = msg.vendor_specific if isinstance(msg.vendor_specific, dict) else {}
+        telegram = vendor.get("telegram") if isinstance(vendor.get("telegram"), Mapping) else {}
+        return (
+            str(telegram.get("chat_id") or vendor.get("telegram_chat_id") or ""),
+            str(telegram.get("message_id") or vendor.get("telegram_message_id") or ""),
+        )
+
+    def _handle_send_update(self, payload: Mapping[str, Any], event_account_id: str = "") -> None:
         receipt = payload.get("send") if isinstance(payload.get("send"), dict) else payload
         send_id = str(receipt.get("send_id") or "")
         echo_message_id = str(receipt.get("echo_message_id") or "")
         if send_id and echo_message_id:
             self.echo_store.link(send_id, echo_message_id)
+            account_id = str(receipt.get("account_id") or event_account_id or "")
+            chat_id = str(receipt.get("chat_id") or "")
+            if account_id and chat_id:
+                self.message_mapping.link_core_message(
+                    self.consumer_id,
+                    account_id,
+                    chat_id,
+                    send_id,
+                    echo_message_id,
+                )
         status = str(receipt.get("status") or "")
         if status == "submitted":
             # Do not present upstream FSM success as confirmed delivery.  The
@@ -959,6 +1006,36 @@ class LinuxWeChatChannel(SlaveChannel):
                 )
             raise
 
+        telegram_chat_id, telegram_message_id = self._telegram_message_ids(efb_msg)
+        author = message.get("author") if isinstance(message.get("author"), Mapping) else {}
+        sender_identity = str(
+            message.get("sender_id")
+            or author.get("member_id")
+            or author.get("sender_id")
+            or ""
+        )
+        try:
+            self.message_mapping.record(
+                self.consumer_id,
+                account_id,
+                chat_id,
+                str(efb_msg.uid),
+                core_message_id=core_message_id,
+                telegram_chat_id=telegram_chat_id,
+                telegram_message_id=telegram_message_id,
+                direction=str(message.get("direction") or ""),
+                sender_identity=sender_identity,
+                core_cursor=str(message.get("_core_cursor") or ""),
+            )
+        except Exception as exc:
+            if reserved and effect_id:
+                self.effect_ledger.mark_uncertain(
+                    self.consumer_id,
+                    effect_id,
+                    reason=f"Mapping persistence failed after external delivery: {exc}",
+                )
+            raise
+
         if reserved and effect_id:
             self.effect_ledger.mark_delivered(
                 self.consumer_id,
@@ -1035,14 +1112,16 @@ class LinuxWeChatChannel(SlaveChannel):
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
 
         if event_type in {"message.created", "message.updated"}:
-            message = payload.get("message") if isinstance(payload.get("message"), dict) else payload
+            raw_message = payload.get("message") if isinstance(payload.get("message"), dict) else payload
+            message = dict(raw_message)
+            message["_core_cursor"] = str(event.get("cursor") or "")
             self._handle_message_event(event_type, account_id, message)
         elif event_type == "message.removed":
             self._emit_removal(account_id, payload)
         elif event_type == "chat.updated":
             self._emit_chat_update(account_id, payload)
         elif event_type == "send.updated":
-            self._handle_send_update(payload)
+            self._handle_send_update(payload, account_id)
         elif event_type == "media.ready":
             media = payload.get("media") if isinstance(payload.get("media"), dict) else payload
             self._retry_pending_media(account_id=account_id, ready_media=media)
