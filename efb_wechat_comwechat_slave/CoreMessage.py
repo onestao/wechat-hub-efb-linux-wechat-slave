@@ -17,7 +17,7 @@ from ehforwarderbot.message import LinkAttribute, LocationAttribute, Substitutio
 from ehforwarderbot.types import MessageID
 
 from .ChatMgr import ChatMgr
-from .Core import CoreClient
+from .Core import CoreAPIError, CoreClient
 
 
 class MediaSelectionError(RuntimeError):
@@ -44,7 +44,12 @@ class CoreMessageBuilder:
         filename: Optional[str],
         mime_type: Optional[str],
     ) -> Tuple[Any, str, str, Path]:
-        media = self.core.get_media(account_id, media_id)
+        try:
+            media = self.core.get_media(account_id, media_id)
+        except CoreAPIError as exc:
+            if exc.status_code == 404 and exc.code == "media_not_found":
+                raise MediaPendingError(f"Core media bytes are not ready for {media_id}") from exc
+            raise
         if media.role != "original":
             raise MediaPermanentError(
                 f"Core returned media role {media.role!r} for {media_id}; expected 'original'"

@@ -37,11 +37,13 @@ from ehforwarderbot.types import ChatID, InstanceID, MessageID
 from . import __version__ as version
 from .ChatMgr import ChatMgr
 from .Core import CoreAPIError, CoreClient, CoreContractError, CoreError, CoreUnavailableError, CursorStore, EchoStore
-from .CoreMessage import CoreMessageBuilder
+from .CoreMessage import CoreMessageBuilder, MediaPendingError, MediaPermanentError
 from .EffectLedger import (
     BLOCKED_UNCERTAIN_EFFECT,
     DELIVERY_SEMANTICS,
     STATE_DELIVERED,
+    STATE_MEDIA_FAILED,
+    STATE_PENDING_MEDIA,
     STATE_RESERVED,
     STATE_UNCERTAIN,
     EffectLedger,
@@ -68,6 +70,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "startup_healthcheck": True,
     "bootstrap_mode": "at_head",
     "startup_history_projection": False,
+    "media_retry_max_attempts": 20,
+    "media_retry_deadline_sec": 300.0,
+    "media_retry_base_sec": 1.0,
+    "media_retry_max_sec": 30.0,
     # Retry3 graceful-shutdown coordination (defect R14-EFB-D3 / Exit 137).
     "shutdown_master_budget_sec": 1.0,
     "shutdown_slave_drain_budget_sec": 0.75,
@@ -135,6 +141,13 @@ class LinuxWeChatChannel(SlaveChannel):
         self._shutdown_evidence: Dict[str, Any] = {}
         self._message_cache: "OrderedDict[Tuple[str, str], Message]" = OrderedDict()
         self._message_cache_size = 2048
+        self.media_retry_max_attempts = max(1, int(self.config.get("media_retry_max_attempts", 20)))
+        self.media_retry_deadline_sec = max(0.0, float(self.config.get("media_retry_deadline_sec", 300.0)))
+        self.media_retry_base_sec = max(0.0, float(self.config.get("media_retry_base_sec", 1.0)))
+        self.media_retry_max_sec = max(
+            self.media_retry_base_sec,
+            float(self.config.get("media_retry_max_sec", 30.0)),
+        )
 
         resolved_data_path = Path(data_path) if data_path is not None else efb_utils.get_data_path(self.channel_id)
         self.cursor_store = CursorStore(resolved_data_path / "core-event-cursor.json")
@@ -728,6 +741,282 @@ class LinuxWeChatChannel(SlaveChannel):
                 dict(details),
             )
 
+    @staticmethod
+    def _is_media_message(message: Mapping[str, Any]) -> bool:
+        return str(message.get("type") or "") in {"image", "sticker", "voice", "video", "file"}
+
+    def _defer_media(
+        self,
+        account_id: str,
+        message: Mapping[str, Any],
+        event_type: str,
+        effect_id: str,
+        error: Exception,
+    ) -> str:
+        now = time.time()
+        current = self.effect_ledger.get_effect(self.consumer_id, effect_id)
+        details = current.get("details", {}) if current else {}
+        try:
+            previous_attempts = int(details.get("attempt_count") or 0)
+        except (TypeError, ValueError):
+            previous_attempts = 0
+        attempt_count = previous_attempts + 1
+        try:
+            deadline_at = float(details.get("deadline_at"))
+        except (TypeError, ValueError):
+            deadline_at = now + self.media_retry_deadline_sec
+        delay = min(
+            self.media_retry_base_sec * (2 ** max(0, attempt_count - 1)),
+            self.media_retry_max_sec,
+        )
+        next_retry_at = now + delay
+        message_id = str(message.get("message_id") or "")
+        media_id = str(message.get("media_id") or "")
+        self.effect_ledger.mark_media_pending(
+            self.consumer_id,
+            effect_id,
+            account_id=account_id,
+            message_id=message_id,
+            event_type=event_type,
+            message=message,
+            media_id=media_id,
+            attempt_count=attempt_count,
+            next_retry_at=next_retry_at,
+            deadline_at=deadline_at,
+            last_error=str(error),
+        )
+        if attempt_count >= self.media_retry_max_attempts or now >= deadline_at:
+            reason = (
+                f"media retry exhausted after {attempt_count} attempt(s)"
+                if attempt_count >= self.media_retry_max_attempts
+                else "media retry deadline exceeded"
+            )
+            self.effect_ledger.mark_media_failed(
+                self.consumer_id,
+                effect_id,
+                account_id=account_id,
+                message_id=message_id,
+                event_type=event_type,
+                reason=reason,
+                details={
+                    "message": dict(message),
+                    "media_id": media_id,
+                    "attempt_count": attempt_count,
+                    "deadline_at": deadline_at,
+                    "last_error": str(error),
+                },
+            )
+            self.logger.error("Media effect %s failed permanently: %s", effect_id, reason)
+            return STATE_MEDIA_FAILED
+        self.logger.info(
+            "Deferred media effect %s in %s (attempt=%d next_retry_at=%.3f): %s",
+            effect_id,
+            STATE_PENDING_MEDIA,
+            attempt_count,
+            next_retry_at,
+            error,
+        )
+        return STATE_PENDING_MEDIA
+
+    def _fail_media(
+        self,
+        account_id: str,
+        message: Mapping[str, Any],
+        event_type: str,
+        effect_id: str,
+        error: Exception,
+    ) -> None:
+        message_id = str(message.get("message_id") or "")
+        self.effect_ledger.mark_media_failed(
+            self.consumer_id,
+            effect_id,
+            account_id=account_id,
+            message_id=message_id,
+            event_type=event_type,
+            reason=str(error),
+            details={
+                "message": dict(message),
+                "media_id": str(message.get("media_id") or ""),
+                "last_error": str(error),
+                "permanent": True,
+            },
+        )
+        self.logger.error("Media effect %s failed closed: %s", effect_id, error)
+
+    def _handle_message_event(
+        self,
+        event_type: str,
+        account_id: str,
+        message: Mapping[str, Any],
+    ) -> None:
+        chat_id = str(message.get("chat_id") or "")
+        if not chat_id:
+            self.logger.warning("Ignoring %s without chat_id: %r", event_type, message)
+            return
+        core_message_id = str(message.get("message_id") or "")
+        efb_message_id = self.echo_store.efb_message_id(core_message_id) if core_message_id else ""
+        if (
+            core_message_id
+            and efb_message_id != core_message_id
+            and str(message.get("direction") or "") == "outgoing"
+        ):
+            self.logger.debug(
+                "Suppressing reconciled outgoing Core echo %s (EFB uid %s)",
+                core_message_id,
+                efb_message_id,
+            )
+            return
+
+        is_media = self._is_media_message(message)
+        if is_media and not core_message_id:
+            self.logger.error("Ignoring media message without durable message_id: %r", message)
+            return
+        effect_id = (
+            self.effect_ledger.compute_effect_id(account_id, core_message_id)
+            if core_message_id
+            else ""
+        )
+        current_status = (
+            self.effect_ledger.get_effect_status(self.consumer_id, effect_id)
+            if effect_id
+            else None
+        )
+        if current_status == STATE_DELIVERED and (event_type == "message.created" or is_media):
+            self.logger.info("Suppressing duplicate delivery for effect %s (DELIVERED)", effect_id)
+            return
+        if current_status in {STATE_RESERVED, STATE_UNCERTAIN}:
+            self.logger.warning(
+                "Suppressing delivery for effect %s: state is %s; fail-closed (%s)",
+                effect_id,
+                current_status,
+                BLOCKED_UNCERTAIN_EFFECT,
+            )
+            return
+        if current_status == STATE_MEDIA_FAILED:
+            self.logger.warning("Suppressing permanently failed media effect %s", effect_id)
+            return
+
+        chat = self._resolve_core_chat(account_id, chat_id)
+        try:
+            efb_msg = self.message_builder.build(message, chat)
+        except MediaPendingError as exc:
+            if not is_media or not effect_id:
+                raise
+            self._defer_media(account_id, message, event_type, effect_id, exc)
+            return
+        except MediaPermanentError as exc:
+            if not is_media or not effect_id:
+                raise
+            self._fail_media(account_id, message, event_type, effect_id, exc)
+            return
+
+        reserved = False
+        if effect_id and current_status == STATE_PENDING_MEDIA:
+            reserved = self.effect_ledger.reserve_pending_effect(
+                self.consumer_id,
+                effect_id,
+                details={"chat_id": chat_id, "media_status": "ready"},
+            )
+        elif effect_id and (event_type == "message.created" or is_media):
+            reserved, reserve_state = self.effect_ledger.reserve_effect(
+                self.consumer_id,
+                effect_id,
+                account_id=account_id,
+                message_id=core_message_id,
+                event_type=event_type,
+                details={"chat_id": chat_id},
+            )
+            if not reserved:
+                self.logger.warning(
+                    "Failed to reserve effect %s: state is %s; fail-closed (%s)",
+                    effect_id,
+                    reserve_state,
+                    BLOCKED_UNCERTAIN_EFFECT,
+                )
+                if efb_msg.file is not None and not getattr(efb_msg.file, "closed", False):
+                    efb_msg.file.close()
+                return
+        if current_status == STATE_PENDING_MEDIA and not reserved:
+            if efb_msg.file is not None and not getattr(efb_msg.file, "closed", False):
+                efb_msg.file.close()
+            self.logger.warning("Pending media effect %s could not transition to RESERVED", effect_id)
+            return
+
+        if core_message_id:
+            efb_msg.uid = MessageID(efb_message_id or core_message_id)
+        if isinstance(efb_msg.target, Message) and efb_msg.target.uid:
+            efb_msg.target.uid = MessageID(self.echo_store.efb_message_id(str(efb_msg.target.uid)))
+        efb_msg.edit = event_type == "message.updated" and current_status != STATE_PENDING_MEDIA
+
+        try:
+            self._deliver_message(efb_msg)
+        except Exception as exc:
+            if reserved and effect_id:
+                self.effect_ledger.mark_uncertain(
+                    self.consumer_id,
+                    effect_id,
+                    reason=f"Exception during external delivery: {exc}",
+                )
+            raise
+
+        if reserved and effect_id:
+            self.effect_ledger.mark_delivered(
+                self.consumer_id,
+                effect_id,
+                efb_uid=str(efb_msg.uid),
+                event_type=event_type,
+                details={"chat_id": chat_id, "type": str(efb_msg.type)},
+            )
+
+    def _retry_pending_media(
+        self,
+        *,
+        account_id: str = "",
+        ready_media: Optional[Mapping[str, Any]] = None,
+    ) -> int:
+        if self._shutdown_in_progress.is_set():
+            return 0
+        media_id = str(ready_media.get("media_id") or "") if ready_media else ""
+        pending = self.effect_ledger.pending_media(
+            self.consumer_id,
+            due_before=None if ready_media else time.time(),
+            media_id=media_id,
+        )
+        attempted = 0
+        for row in pending:
+            if account_id and str(row.get("account_id") or "") != account_id:
+                continue
+            raw_message = row.get("details", {}).get("message")
+            if not isinstance(raw_message, dict):
+                self.effect_ledger.mark_media_failed(
+                    self.consumer_id,
+                    str(row["effect_id"]),
+                    account_id=str(row["account_id"]),
+                    message_id=str(row["message_id"]),
+                    event_type=str(row["event_type"]),
+                    reason="pending media record has no recoverable message payload",
+                )
+                continue
+            message = dict(raw_message)
+            # A scheduled retry probes the authoritative media endpoint. A
+            # media.ready event additionally supplies the latest role/status.
+            message["media_status"] = str(
+                ready_media.get("status") if ready_media else "ready"
+            )
+            if ready_media and ready_media.get("role"):
+                message["media_role"] = str(ready_media["role"])
+            if ready_media and ready_media.get("filename"):
+                message["filename"] = str(ready_media["filename"])
+            if ready_media and ready_media.get("mime_type"):
+                message["mime_type"] = str(ready_media["mime_type"])
+            self._handle_message_event(
+                "message.updated",
+                str(row["account_id"]),
+                message,
+            )
+            attempted += 1
+        return attempted
+
     def _handle_event(self, event: Mapping[str, Any]) -> None:
         if self._shutdown_in_progress.is_set():
             # Shutdown has begun: the durable state has already been flushed and
@@ -747,102 +1036,17 @@ class LinuxWeChatChannel(SlaveChannel):
 
         if event_type in {"message.created", "message.updated"}:
             message = payload.get("message") if isinstance(payload.get("message"), dict) else payload
-            chat_id = str(message.get("chat_id") or "")
-            if not chat_id:
-                self.logger.warning("Ignoring %s without chat_id: %r", event_type, event)
-                return
-            core_message_id = str(message.get("message_id") or "")
-            efb_message_id = self.echo_store.efb_message_id(core_message_id) if core_message_id else ""
-            if (
-                core_message_id
-                and efb_message_id != core_message_id
-                and str(message.get("direction") or "") == "outgoing"
-            ):
-                # Kettly already logged the Telegram-originated message using
-                # the send_id returned by send_message().  A later Core
-                # message.created/updated echo must only reconcile identity;
-                # forwarding it again would create a duplicate Telegram post.
-                self.logger.debug(
-                    "Suppressing reconciled outgoing Core echo %s (EFB uid %s)",
-                    core_message_id,
-                    efb_message_id,
-                )
-                return
-            # Check effect ledger for message.created to guarantee AT_MOST_ONCE_WITH_FAIL_CLOSED_UNCERTAIN side effect
-            effect_id = ""
-            if event_type == "message.created" and core_message_id:
-                effect_id = self.effect_ledger.compute_effect_id(account_id, core_message_id)
-                current_status = self.effect_ledger.get_effect_status(self.consumer_id, effect_id)
-                if current_status == STATE_DELIVERED:
-                    self.logger.info(
-                        "Suppressing duplicate delivery for effect %s (core_msg_id=%s) via effect ledger (DELIVERED)",
-                        effect_id,
-                        core_message_id,
-                    )
-                    return
-                elif current_status in (STATE_RESERVED, STATE_UNCERTAIN):
-                    self.logger.warning(
-                        "Suppressing delivery for effect %s (core_msg_id=%s): state is %s; fail-closed (%s)",
-                        effect_id,
-                        core_message_id,
-                        current_status,
-                        BLOCKED_UNCERTAIN_EFFECT,
-                    )
-                    return
-
-                # Durably reserve effect before external delivery call
-                reserved, reserve_state = self.effect_ledger.reserve_effect(
-                    self.consumer_id,
-                    effect_id,
-                    account_id=account_id,
-                    message_id=core_message_id,
-                    event_type=event_type,
-                    details={"chat_id": chat_id},
-                )
-                if not reserved:
-                    self.logger.warning(
-                        "Failed to reserve effect %s: state is %s; fail-closed (%s)",
-                        effect_id,
-                        reserve_state,
-                        BLOCKED_UNCERTAIN_EFFECT,
-                    )
-                    return
-
-            chat = self._resolve_core_chat(account_id, chat_id)
-            efb_msg = self.message_builder.build(message, chat)
-            if core_message_id:
-                efb_msg.uid = MessageID(efb_message_id or core_message_id)
-            if isinstance(efb_msg.target, Message) and efb_msg.target.uid:
-                efb_msg.target.uid = MessageID(self.echo_store.efb_message_id(str(efb_msg.target.uid)))
-            efb_msg.edit = event_type == "message.updated"
-
-            try:
-                self._deliver_message(efb_msg)
-            except Exception as ex:
-                if event_type == "message.created" and effect_id:
-                    self.effect_ledger.mark_uncertain(
-                        self.consumer_id,
-                        effect_id,
-                        reason=f"Exception during external delivery: {ex}",
-                    )
-                raise
-
-            # Transition effect to DELIVERED in durable ledger
-            if event_type == "message.created" and effect_id:
-                self.effect_ledger.mark_delivered(
-                    self.consumer_id,
-                    effect_id,
-                    efb_uid=str(efb_msg.uid),
-                    event_type=event_type,
-                    details={"chat_id": chat_id, "type": str(efb_msg.type)},
-                )
+            self._handle_message_event(event_type, account_id, message)
         elif event_type == "message.removed":
             self._emit_removal(account_id, payload)
         elif event_type == "chat.updated":
             self._emit_chat_update(account_id, payload)
         elif event_type == "send.updated":
             self._handle_send_update(payload)
-        elif event_type in {"account.status", "media.ready"}:
+        elif event_type == "media.ready":
+            media = payload.get("media") if isinstance(payload.get("media"), dict) else payload
+            self._retry_pending_media(account_id=account_id, ready_media=media)
+        elif event_type == "account.status":
             self.logger.info("Core event %s for %s: %r", event_type, account_id, payload)
         else:
             # Contract explicitly requires future unknown event types to be tolerated.
@@ -882,6 +1086,7 @@ class LinuxWeChatChannel(SlaveChannel):
     def poll_once(self, poll_timeout: Optional[int] = None) -> int:
         """Process one Core event page. Exposed for deterministic integration tests."""
         self._health()
+        self._retry_pending_media()
         cursor = self.cursor_store.load(default=None)
         if cursor is None:
             cursor = self._ensure_bootstrap_aligned()

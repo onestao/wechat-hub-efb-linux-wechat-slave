@@ -40,6 +40,8 @@ from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 STATE_RESERVED = "RESERVED"
 STATE_DELIVERED = "DELIVERED"
 STATE_UNCERTAIN = "UNCERTAIN"
+STATE_PENDING_MEDIA = "PENDING_MEDIA"
+STATE_MEDIA_FAILED = "MEDIA_FAILED"
 
 BLOCKED_UNCERTAIN_EFFECT = "BLOCKED_UNCERTAIN_EFFECT"
 DELIVERY_SEMANTICS = "AT_MOST_ONCE_WITH_FAIL_CLOSED_UNCERTAIN"
@@ -143,7 +145,13 @@ class EffectLedger:
         Used by forensic/qualification tooling (Retry3 cross-run sentinel and
         evidence generator). Never mutates the ledger.
         """
-        counts: Dict[str, int] = {STATE_RESERVED: 0, STATE_DELIVERED: 0, STATE_UNCERTAIN: 0}
+        counts: Dict[str, int] = {
+            STATE_RESERVED: 0,
+            STATE_DELIVERED: 0,
+            STATE_UNCERTAIN: 0,
+            STATE_PENDING_MEDIA: 0,
+            STATE_MEDIA_FAILED: 0,
+        }
         if not isinstance(self.db_path, Path) or not self.db_path.exists():
             return counts
         conn = sqlite3.connect(self._uri, timeout=15.0)
@@ -189,6 +197,217 @@ class EffectLedger:
             return self.is_effect_delivered(consumer_id, effect_id)
         except ValueError:
             return False
+
+    def mark_media_pending(
+        self,
+        consumer_id: str,
+        effect_id: str,
+        *,
+        account_id: str,
+        message_id: str,
+        event_type: str,
+        message: Mapping[str, Any],
+        media_id: str,
+        attempt_count: int,
+        next_retry_at: float,
+        deadline_at: float,
+        last_error: str,
+    ) -> bool:
+        """Persist a retryable media observation before any external effect is reserved."""
+        cid = str(consumer_id or "").strip()
+        eid = str(effect_id or "").strip()
+        acc = str(account_id or "").strip()
+        mid = str(message_id or "").strip()
+        now = _utc_now_iso()
+
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT status, details_json FROM effect_ledger WHERE consumer_id = ? AND effect_id = ?",
+                (cid, eid),
+            ).fetchone()
+            if row is not None and str(row["status"]) != STATE_PENDING_MEDIA:
+                return False
+
+            details: Dict[str, Any] = {}
+            if row is not None:
+                try:
+                    details.update(json.loads(row["details_json"] or "{}"))
+                except Exception:
+                    pass
+            details.update(
+                {
+                    "pending_media": True,
+                    "message": dict(message),
+                    "media_id": str(media_id or ""),
+                    "attempt_count": int(attempt_count),
+                    "next_retry_at": float(next_retry_at),
+                    "deadline_at": float(deadline_at),
+                    "last_error": str(last_error or ""),
+                }
+            )
+            details_str = json.dumps(details, ensure_ascii=False)
+
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO effect_ledger (
+                        consumer_id, effect_id, account_id, message_id,
+                        efb_uid, event_type, status, created_at, updated_at, details_json
+                    ) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?)
+                    """,
+                    (cid, eid, acc, mid, event_type, STATE_PENDING_MEDIA, now, now, details_str),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE effect_ledger
+                    SET event_type = ?, updated_at = ?, details_json = ?
+                    WHERE consumer_id = ? AND effect_id = ? AND status = ?
+                    """,
+                    (event_type, now, details_str, cid, eid, STATE_PENDING_MEDIA),
+                )
+            return True
+
+    def reserve_pending_effect(
+        self,
+        consumer_id: str,
+        effect_id: str,
+        *,
+        details: Optional[Mapping[str, Any]] = None,
+    ) -> bool:
+        """Atomically move verified ready media into the external-call reservation."""
+        cid = str(consumer_id or "").strip()
+        eid = str(effect_id or "").strip()
+        now = _utc_now_iso()
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT details_json FROM effect_ledger WHERE consumer_id = ? AND effect_id = ? AND status = ?",
+                (cid, eid, STATE_PENDING_MEDIA),
+            ).fetchone()
+            if row is None:
+                return False
+            merged: Dict[str, Any] = {}
+            try:
+                merged.update(json.loads(row["details_json"] or "{}"))
+            except Exception:
+                pass
+            merged["media_ready_at"] = now
+            if details:
+                merged.update(details)
+            cursor = conn.execute(
+                """
+                UPDATE effect_ledger
+                SET status = ?, updated_at = ?, details_json = ?
+                WHERE consumer_id = ? AND effect_id = ? AND status = ?
+                """,
+                (
+                    STATE_RESERVED,
+                    now,
+                    json.dumps(merged, ensure_ascii=False),
+                    cid,
+                    eid,
+                    STATE_PENDING_MEDIA,
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def mark_media_failed(
+        self,
+        consumer_id: str,
+        effect_id: str,
+        *,
+        account_id: str,
+        message_id: str,
+        event_type: str,
+        reason: str,
+        details: Optional[Mapping[str, Any]] = None,
+    ) -> bool:
+        """Record deterministic permanent/exhausted media failure with forensic detail."""
+        cid = str(consumer_id or "").strip()
+        eid = str(effect_id or "").strip()
+        acc = str(account_id or "").strip()
+        mid = str(message_id or "").strip()
+        now = _utc_now_iso()
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT status, details_json FROM effect_ledger WHERE consumer_id = ? AND effect_id = ?",
+                (cid, eid),
+            ).fetchone()
+            if row is not None and str(row["status"]) not in {STATE_PENDING_MEDIA, STATE_MEDIA_FAILED}:
+                return False
+            merged: Dict[str, Any] = {}
+            if row is not None:
+                try:
+                    merged.update(json.loads(row["details_json"] or "{}"))
+                except Exception:
+                    pass
+            merged["media_failed_at"] = now
+            merged["media_failure_reason"] = str(reason or "media failed")
+            if details:
+                merged.update(details)
+            details_str = json.dumps(merged, ensure_ascii=False)
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO effect_ledger (
+                        consumer_id, effect_id, account_id, message_id,
+                        efb_uid, event_type, status, created_at, updated_at, details_json
+                    ) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?)
+                    """,
+                    (cid, eid, acc, mid, event_type, STATE_MEDIA_FAILED, now, now, details_str),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE effect_ledger
+                    SET status = ?, event_type = ?, updated_at = ?, details_json = ?
+                    WHERE consumer_id = ? AND effect_id = ?
+                    """,
+                    (STATE_MEDIA_FAILED, event_type, now, details_str, cid, eid),
+                )
+            return True
+
+    def pending_media(
+        self,
+        consumer_id: str,
+        *,
+        due_before: Optional[float] = None,
+        media_id: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Return durable pending rows, optionally filtered by retry time and media id."""
+        cid = str(consumer_id or "").strip()
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM effect_ledger WHERE consumer_id = ? AND status = ? ORDER BY created_at, effect_id",
+                (cid, STATE_PENDING_MEDIA),
+            ).fetchall()
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            try:
+                details = json.loads(row["details_json"] or "{}")
+            except Exception:
+                details = {}
+            if media_id and str(details.get("media_id") or "") != str(media_id):
+                continue
+            if due_before is not None:
+                try:
+                    next_retry_at = float(details.get("next_retry_at") or 0.0)
+                except (TypeError, ValueError):
+                    next_retry_at = 0.0
+                if next_retry_at > float(due_before):
+                    continue
+            result.append(
+                {
+                    "consumer_id": row["consumer_id"],
+                    "effect_id": row["effect_id"],
+                    "account_id": row["account_id"],
+                    "message_id": row["message_id"],
+                    "event_type": row["event_type"],
+                    "status": row["status"],
+                    "details": details,
+                }
+            )
+        return result
 
     def reserve_effect(
         self,
