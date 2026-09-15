@@ -25,7 +25,14 @@ jobs:
           python -m pip install setuptools==75.8.2 -r requirements.txt
 
       - name: Run EFB tests
-        run: python -m unittest tests.test_uid -v
+        run: |
+          python -m unittest \
+            tests.test_uid \
+            tests.test_efb_replay_safety_and_lifecycle \
+            tests.test_channel_mock_core \
+            tests.test_kettly_etm_compat \
+            tests.test_shutdown_deterministic \
+            -v
 
       - name: Compile-check package
         run: python -m compileall -q efb_wechat_comwechat_slave

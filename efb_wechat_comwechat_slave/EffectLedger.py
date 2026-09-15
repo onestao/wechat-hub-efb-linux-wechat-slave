@@ -118,6 +118,51 @@ class EffectLedger:
             raise ValueError(f"account_id and message_id are required: account={acc!r}, message={msg!r}")
         return f"{acc}:{msg}"
 
+    def checkpoint_wal(self) -> None:
+        """Consolidate the SQLite WAL into the main database file.
+
+        Durable-state helper for graceful shutdown (Retry3, defect R14-EFB-D3).
+        Every committed transaction is already fsync'd because the ledger runs
+        with ``synchronous = FULL``; this call is a storage-consolidation step,
+        not a durability requirement.  It never inserts, updates, deletes,
+        truncates or recreates ledger rows, and it never removes the database
+        file or its WAL/SHM sidecars.
+        """
+        if not isinstance(self.db_path, Path) or not self.db_path.exists():
+            return
+        conn = sqlite3.connect(self._uri, timeout=15.0)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def status_counts(self, consumer_id: Optional[str] = None) -> Dict[str, int]:
+        """Read-only status histogram of the ledger.
+
+        Used by forensic/qualification tooling (Retry3 cross-run sentinel and
+        evidence generator). Never mutates the ledger.
+        """
+        counts: Dict[str, int] = {STATE_RESERVED: 0, STATE_DELIVERED: 0, STATE_UNCERTAIN: 0}
+        if not isinstance(self.db_path, Path) or not self.db_path.exists():
+            return counts
+        conn = sqlite3.connect(self._uri, timeout=15.0)
+        try:
+            if consumer_id:
+                rows = conn.execute(
+                    "SELECT status, COUNT(*) FROM effect_ledger WHERE consumer_id = ? GROUP BY status",
+                    (str(consumer_id).strip(),),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT status, COUNT(*) FROM effect_ledger GROUP BY status"
+                ).fetchall()
+        finally:
+            conn.close()
+        for status, count in rows:
+            counts[str(status)] = int(count)
+        return counts
+
     def get_effect_status(self, consumer_id: str, effect_id: str) -> Optional[str]:
         """Query current state machine status: RESERVED, DELIVERED, UNCERTAIN, or None."""
         cid = str(consumer_id or "").strip()

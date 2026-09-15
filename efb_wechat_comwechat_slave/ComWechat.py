@@ -12,6 +12,7 @@ import json
 import logging
 import mimetypes
 import threading
+import time
 import uuid
 from collections import OrderedDict
 from pathlib import Path
@@ -45,6 +46,11 @@ from .EffectLedger import (
     STATE_UNCERTAIN,
     EffectLedger,
 )
+from .ShutdownCoordinator import (
+    SHUTDOWN_EVIDENCE_MARKER,
+    ShutdownCoordinator,
+    install_shutdown_coordinator,
+)
 from .UID import InvalidUID, decode_chat_uid
 
 
@@ -62,6 +68,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "startup_healthcheck": True,
     "bootstrap_mode": "at_head",
     "startup_history_projection": False,
+    # Retry3 graceful-shutdown coordination (defect R14-EFB-D3 / Exit 137).
+    "shutdown_master_budget_sec": 1.0,
+    "shutdown_slave_drain_budget_sec": 0.75,
+    "shutdown_hard_exit": True,
+    "shutdown_install_deferred": True,
 }
 
 
@@ -114,6 +125,14 @@ class LinuxWeChatChannel(SlaveChannel):
         self.chat_mgr = ChatMgr(self)
         self.message_builder = CoreMessageBuilder(self.core, self.chat_mgr)
         self._stop_event = threading.Event()
+        # Retry3 shutdown coordination state.
+        self._shutdown_in_progress = threading.Event()
+        self._checkpoint_flush_lock = threading.Lock()
+        self._checkpoint_flush_completed = False
+        self._checkpoint_flush_cursor: Optional[int] = None
+        self._stop_polling_lock = threading.Lock()
+        self._shutdown_coordinator: Optional[ShutdownCoordinator] = None
+        self._shutdown_evidence: Dict[str, Any] = {}
         self._message_cache: "OrderedDict[Tuple[str, str], Message]" = OrderedDict()
         self._message_cache_size = 2048
 
@@ -163,8 +182,125 @@ class LinuxWeChatChannel(SlaveChannel):
             sorted(self.account_filter) or "all",
         )
 
+        self._install_shutdown_coordinator()
+
+    # ------------------------------------------------------------------ #
+    # Retry3 graceful shutdown coordination (defect R14-EFB-D3)
+    # ------------------------------------------------------------------ #
+
+    def _install_shutdown_coordinator(self) -> Optional[ShutdownCoordinator]:
+        """Install the ordered/bounded shutdown coordinator (idempotent)."""
+        if self._shutdown_coordinator is not None:
+            return self._shutdown_coordinator
+        try:
+            coordinator_obj = install_shutdown_coordinator(
+                self,
+                logger=self.logger,
+                master_budget_sec=float(self.config.get("shutdown_master_budget_sec", 1.0)),
+                slave_drain_budget_sec=float(
+                    self.config.get("shutdown_slave_drain_budget_sec", 0.75)
+                ),
+                hard_exit=bool(self.config.get("shutdown_hard_exit", True)),
+                install_deferred=bool(self.config.get("shutdown_install_deferred", True)),
+            )
+        except Exception:
+            self.logger.exception("Failed to install shutdown coordinator")
+            return None
+        self._shutdown_coordinator = coordinator_obj
+        return coordinator_obj
+
+    def suppress_external_dispatch(self) -> None:
+        """Refuse any further outbound external delivery (idempotent)."""
+        self._shutdown_in_progress.set()
+
+    def drain_for_shutdown(self, *, budget_sec: float = 0.75) -> Dict[str, Any]:
+        """Quiesce polling and durably flush local state before the master stops.
+
+        Order (Retry3 corrective engineering, defect R14-EFB-D3):
+          1. stop polling Core for new work;
+          2. flush the durable cursor / checkpoint to Core;
+          3. checkpoint the effect-ledger WAL so DELIVERED/RESERVED rows are
+             durable on disk (the ledger is never deleted or truncated);
+          4. forbid any further external dispatch.
+        """
+        started = time.monotonic()
+        detail: Dict[str, Any] = {
+            "poll_stopped": False,
+            "core_session_closed": False,
+            "checkpoint_flushed": False,
+            "checkpoint_cursor": None,
+            "ledger_wal_checkpointed": False,
+            "poll_thread_joined": False,
+            "delivery_suppressed": False,
+        }
+
+        # 4 first: no new outbound delivery may be attempted from here on.
+        self.suppress_external_dispatch()
+        detail["delivery_suppressed"] = True
+
+        # 1: stop the Core poll loop.
+        self.stop_polling()
+        detail["poll_stopped"] = self._stop_event.is_set()
+
+        # 1b: break any in-flight Core poll request so the poll thread can exit.
+        session = getattr(self.core, "session", None)
+        if session is not None:
+            try:
+                session.close()
+                detail["core_session_closed"] = True
+            except Exception:
+                self.logger.debug("Core session close during shutdown failed", exc_info=True)
+
+        # 1c: bounded join of the slave poll thread when it is reachable.
+        deadline = started + max(0.0, float(budget_sec))
+        for thread in self._slave_poll_threads():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if thread.is_alive():
+                thread.join(timeout=remaining)
+            detail["poll_thread_joined"] = not thread.is_alive()
+
+        # 2: flush the final checkpoint synchronously (idempotent).
+        cursor = self._flush_final_checkpoint()
+        detail["checkpoint_flushed"] = self._checkpoint_flush_completed
+        detail["checkpoint_cursor"] = cursor
+
+        # 3: make the effect-ledger WAL durable without mutating any row.
+        try:
+            self.effect_ledger.checkpoint_wal()
+            detail["ledger_wal_checkpointed"] = True
+        except Exception:
+            self.logger.warning("Effect-ledger WAL checkpoint on shutdown failed", exc_info=True)
+
+        detail["elapsed_sec"] = round(time.monotonic() - started, 6)
+        self._shutdown_evidence = detail
+        self.logger.info(
+            "%s drain complete: %s",
+            SHUTDOWN_EVIDENCE_MARKER,
+            json.dumps(detail, ensure_ascii=False, sort_keys=True),
+        )
+        return detail
+
+    def _slave_poll_threads(self) -> Tuple[threading.Thread, ...]:
+        """Best-effort lookup of this channel's EFB poll thread."""
+        try:
+            from ehforwarderbot import coordinator as efb_coordinator
+
+            threads = getattr(efb_coordinator, "slave_threads", None) or {}
+            found = [t for key, t in threads.items() if str(key).startswith(self.channel_id)]
+            return tuple(found)
+        except Exception:
+            return ()
+
     def _sig_handler(self, signum: int, frame: Any) -> None:
         self.logger.info("Received termination signal %s, initiating graceful shutdown < 2s...", signum)
+        coordinator_obj = self._shutdown_coordinator
+        if coordinator_obj is not None and not coordinator_obj.ran:
+            # Run the full ordered/bounded path even if EFB's own SIGTERM handler
+            # is not the one that fired (e.g. the slave registered last).
+            coordinator_obj.run(trigger=f"signal:{signum}")
+            return
         self.stop_polling()
 
     def _ensure_bootstrap_aligned(self) -> str:
@@ -593,6 +729,16 @@ class LinuxWeChatChannel(SlaveChannel):
             )
 
     def _handle_event(self, event: Mapping[str, Any]) -> None:
+        if self._shutdown_in_progress.is_set():
+            # Shutdown has begun: the durable state has already been flushed and
+            # no further external side effect may be produced. Events are left
+            # unprocessed on purpose so that the preserved cursor replays them
+            # after the next start, where the effect ledger decides delivery.
+            self.logger.info(
+                "Suppressing event processing during shutdown (event_type=%s)",
+                str(event.get("event_type") or ""),
+            )
+            return
         event_type = str(event.get("event_type") or "")
         account_id = str(event.get("account_id") or "")
         if self.account_filter and account_id not in self.account_filter:
@@ -702,20 +848,36 @@ class LinuxWeChatChannel(SlaveChannel):
             # Contract explicitly requires future unknown event types to be tolerated.
             self.logger.warning("Ignoring unknown Core event type %r", event_type)
 
-    def _flush_final_checkpoint(self) -> None:
-        """Flush final checkpoint to Core before exiting (Defect D3)."""
-        try:
-            current_cursor = self.cursor_store.load(default=None)
-            if current_cursor is not None:
-                cur_int = int(current_cursor)
-                self.core.checkpoint_events(
-                    self.consumer_id,
-                    cur_int,
-                    subscription_account_id=next(iter(self.account_filter), "") if len(self.account_filter) == 1 else "",
-                )
-                self.logger.info("Flushed final checkpoint %s on shutdown", cur_int)
-        except Exception as exc:
-            self.logger.debug("Final checkpoint flush on shutdown skipped/failed: %s", exc)
+    def _flush_final_checkpoint(self) -> Optional[int]:
+        """Flush the final checkpoint to Core before exiting (Defect D3).
+
+        Idempotent and thread-safe: repeated shutdown signals, or a concurrent
+        call from ``poll()``'s ``finally`` block and the shutdown coordinator,
+        must not double-flush. Returns the flushed cursor (or ``None``).
+        """
+        with self._checkpoint_flush_lock:
+            if self._checkpoint_flush_completed:
+                return self._checkpoint_flush_cursor
+            cursor: Optional[int] = None
+            try:
+                current_cursor = self.cursor_store.load(default=None)
+                if current_cursor is not None:
+                    cur_int = int(current_cursor)
+                    self.core.checkpoint_events(
+                        self.consumer_id,
+                        cur_int,
+                        subscription_account_id=next(iter(self.account_filter), "") if len(self.account_filter) == 1 else "",
+                    )
+                    cursor = cur_int
+                    self.logger.info("Flushed final checkpoint %s on shutdown", cur_int)
+                else:
+                    self.logger.debug("No local cursor present; nothing to flush on shutdown")
+            except Exception as exc:
+                self.logger.debug("Final checkpoint flush on shutdown skipped/failed: %s", exc)
+                return None
+            self._checkpoint_flush_completed = True
+            self._checkpoint_flush_cursor = cursor
+            return cursor
 
     def poll_once(self, poll_timeout: Optional[int] = None) -> int:
         """Process one Core event page. Exposed for deterministic integration tests."""
@@ -771,6 +933,10 @@ class LinuxWeChatChannel(SlaveChannel):
         return processed
 
     def poll(self) -> None:
+        # The master channel only exists after all slaves are constructed, so the
+        # shutdown coordinator is installed here as well (idempotent) to close the
+        # slave-before-master initialisation race in ehforwarderbot.__main__.init.
+        self._install_shutdown_coordinator()
         backoff = self.poll_interval
         try:
             while not self._stop_event.is_set():
@@ -796,7 +962,12 @@ class LinuxWeChatChannel(SlaveChannel):
             self._flush_final_checkpoint()
 
     def stop_polling(self) -> None:
-        self._stop_event.set()
+        """Idempotent, re-entrant stop of the Core poll loop (Retry3)."""
+        with self._stop_polling_lock:
+            already_stopped = self._stop_event.is_set()
+            self._stop_event.set()
+        if already_stopped:
+            self.logger.debug("stop_polling() called again; stop event already set")
         try:
             if hasattr(self.core, "session") and self.core.session:
                 self.core.session.close()
