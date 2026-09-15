@@ -37,7 +37,14 @@ from . import __version__ as version
 from .ChatMgr import ChatMgr
 from .Core import CoreAPIError, CoreClient, CoreContractError, CoreError, CoreUnavailableError, CursorStore, EchoStore
 from .CoreMessage import CoreMessageBuilder
-from .EffectLedger import EffectLedger
+from .EffectLedger import (
+    BLOCKED_UNCERTAIN_EFFECT,
+    DELIVERY_SEMANTICS,
+    STATE_DELIVERED,
+    STATE_RESERVED,
+    STATE_UNCERTAIN,
+    EffectLedger,
+)
 from .UID import InvalidUID, decode_chat_uid
 
 
@@ -114,6 +121,14 @@ class LinuxWeChatChannel(SlaveChannel):
         self.cursor_store = CursorStore(resolved_data_path / "core-event-cursor.json")
         self.echo_store = EchoStore(resolved_data_path / "core-send-echo.json")
         self.effect_ledger = EffectLedger(resolved_data_path / "core-effect-ledger.sqlite3")
+        reconciled = self.effect_ledger.reconcile_on_startup(self.consumer_id)
+        if reconciled:
+            self.logger.warning(
+                "Startup reconciliation marked %d lingering RESERVED effects as UNCERTAIN (%s): %s",
+                len(reconciled),
+                BLOCKED_UNCERTAIN_EFFECT,
+                reconciled,
+            )
         self.startup_history_projection = bool(self.config.get("startup_history_projection", False))
 
         # Register graceful shutdown handlers
@@ -607,15 +622,43 @@ class LinuxWeChatChannel(SlaveChannel):
                     efb_message_id,
                 )
                 return
-            # Check effect ledger for message.created to guarantee at-most-once external side effect
+            # Check effect ledger for message.created to guarantee AT_MOST_ONCE_WITH_FAIL_CLOSED_UNCERTAIN side effect
             effect_id = ""
             if event_type == "message.created" and core_message_id:
                 effect_id = self.effect_ledger.compute_effect_id(account_id, core_message_id)
-                if self.effect_ledger.is_effect_delivered(self.consumer_id, effect_id):
+                current_status = self.effect_ledger.get_effect_status(self.consumer_id, effect_id)
+                if current_status == STATE_DELIVERED:
                     self.logger.info(
-                        "Suppressing duplicate delivery for effect %s (core_msg_id=%s) via effect ledger",
+                        "Suppressing duplicate delivery for effect %s (core_msg_id=%s) via effect ledger (DELIVERED)",
                         effect_id,
                         core_message_id,
+                    )
+                    return
+                elif current_status in (STATE_RESERVED, STATE_UNCERTAIN):
+                    self.logger.warning(
+                        "Suppressing delivery for effect %s (core_msg_id=%s): state is %s; fail-closed (%s)",
+                        effect_id,
+                        core_message_id,
+                        current_status,
+                        BLOCKED_UNCERTAIN_EFFECT,
+                    )
+                    return
+
+                # Durably reserve effect before external delivery call
+                reserved, reserve_state = self.effect_ledger.reserve_effect(
+                    self.consumer_id,
+                    effect_id,
+                    account_id=account_id,
+                    message_id=core_message_id,
+                    event_type=event_type,
+                    details={"chat_id": chat_id},
+                )
+                if not reserved:
+                    self.logger.warning(
+                        "Failed to reserve effect %s: state is %s; fail-closed (%s)",
+                        effect_id,
+                        reserve_state,
+                        BLOCKED_UNCERTAIN_EFFECT,
                     )
                     return
 
@@ -626,15 +669,23 @@ class LinuxWeChatChannel(SlaveChannel):
             if isinstance(efb_msg.target, Message) and efb_msg.target.uid:
                 efb_msg.target.uid = MessageID(self.echo_store.efb_message_id(str(efb_msg.target.uid)))
             efb_msg.edit = event_type == "message.updated"
-            self._deliver_message(efb_msg)
 
-            # Record successfully delivered message.created in effect ledger
+            try:
+                self._deliver_message(efb_msg)
+            except Exception as ex:
+                if event_type == "message.created" and effect_id:
+                    self.effect_ledger.mark_uncertain(
+                        self.consumer_id,
+                        effect_id,
+                        reason=f"Exception during external delivery: {ex}",
+                    )
+                raise
+
+            # Transition effect to DELIVERED in durable ledger
             if event_type == "message.created" and effect_id:
-                self.effect_ledger.record_delivered(
+                self.effect_ledger.mark_delivered(
                     self.consumer_id,
                     effect_id,
-                    account_id=account_id,
-                    message_id=core_message_id,
                     efb_uid=str(efb_msg.uid),
                     event_type=event_type,
                     details={"chat_id": chat_id, "type": str(efb_msg.type)},

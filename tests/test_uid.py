@@ -1,5 +1,11 @@
 import unittest
 
+try:
+    import ehforwarderbot
+except ImportError:
+    import tests.stub_ehforwarderbot as _stub
+    _stub.install_stubs()
+
 from efb_wechat_comwechat_slave.UID import (
     InvalidUID,
     decode_chat_uid,

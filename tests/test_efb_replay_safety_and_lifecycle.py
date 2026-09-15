@@ -30,13 +30,26 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest import mock
 
+try:
+    import ehforwarderbot
+except ImportError:
+    import tests.stub_ehforwarderbot as _stub
+    _stub.install_stubs()
+
 from ehforwarderbot import Message, MsgType, coordinator
 from ehforwarderbot.chat import Chat
 from ehforwarderbot.types import ChatID, InstanceID, MessageID
 
 from efb_wechat_comwechat_slave.ComWechat import LinuxWeChatChannel
 from efb_wechat_comwechat_slave.Core import CoreClient, CursorStore
-from efb_wechat_comwechat_slave.EffectLedger import EffectLedger
+from efb_wechat_comwechat_slave.EffectLedger import (
+    BLOCKED_UNCERTAIN_EFFECT,
+    DELIVERY_SEMANTICS,
+    STATE_DELIVERED,
+    STATE_RESERVED,
+    STATE_UNCERTAIN,
+    EffectLedger,
+)
 
 
 class TestEffectLedgerUnit(unittest.TestCase):
@@ -119,6 +132,73 @@ class TestEffectLedgerUnit(unittest.TestCase):
         )
         self.assertTrue(self.ledger.is_message_delivered(consumer, "acc-alpha", "same-msg-id"))
         self.assertFalse(self.ledger.is_message_delivered(consumer, "acc-beta", "same-msg-id"))
+
+    def test_state_machine_transitions(self) -> None:
+        consumer = "efb-linux-wechat:wechat.linux"
+        eid = self.ledger.compute_effect_id("acc-alpha", "msg-sm-1")
+
+        # 1. Initially unseen
+        self.assertIsNone(self.ledger.get_effect_status(consumer, eid))
+
+        # 2. Reserve effect
+        reserved, status = self.ledger.reserve_effect(
+            consumer, eid, account_id="acc-alpha", message_id="msg-sm-1"
+        )
+        self.assertTrue(reserved)
+        self.assertEqual(status, STATE_RESERVED)
+        self.assertEqual(self.ledger.get_effect_status(consumer, eid), STATE_RESERVED)
+
+        # 3. Duplicate reservation while RESERVED fails closed
+        dup_reserved, dup_status = self.ledger.reserve_effect(
+            consumer, eid, account_id="acc-alpha", message_id="msg-sm-1"
+        )
+        self.assertFalse(dup_reserved)
+        self.assertEqual(dup_status, BLOCKED_UNCERTAIN_EFFECT)
+
+        # 4. Transition to DELIVERED
+        marked = self.ledger.mark_delivered(consumer, eid, efb_uid="uid-delivered")
+        self.assertTrue(marked)
+        self.assertEqual(self.ledger.get_effect_status(consumer, eid), STATE_DELIVERED)
+        self.assertTrue(self.ledger.is_effect_delivered(consumer, eid))
+
+        # 5. Subsequent reservation fails with DELIVERED
+        after_reserved, after_status = self.ledger.reserve_effect(
+            consumer, eid, account_id="acc-alpha", message_id="msg-sm-1"
+        )
+        self.assertFalse(after_reserved)
+        self.assertEqual(after_status, STATE_DELIVERED)
+
+    def test_reconcile_on_startup_transitions_reserved_to_uncertain(self) -> None:
+        consumer = "efb-linux-wechat:wechat.linux"
+        eid_1 = self.ledger.compute_effect_id("acc-alpha", "msg-crash-1")
+        eid_2 = self.ledger.compute_effect_id("acc-alpha", "msg-delivered-2")
+
+        # Effect 1 was left in RESERVED (simulating process crash during external call)
+        self.ledger.reserve_effect(consumer, eid_1, account_id="acc-alpha", message_id="msg-crash-1")
+        # Effect 2 was properly finalized to DELIVERED
+        self.ledger.reserve_effect(consumer, eid_2, account_id="acc-alpha", message_id="msg-delivered-2")
+        self.ledger.mark_delivered(consumer, eid_2, efb_uid="uid-2")
+
+        # Simulate startup reconciliation
+        reconciled = self.ledger.reconcile_on_startup(consumer)
+        self.assertEqual(reconciled, [eid_1])
+
+        # Effect 1 must now be UNCERTAIN and fail closed
+        self.assertEqual(self.ledger.get_effect_status(consumer, eid_1), STATE_UNCERTAIN)
+        rec1 = self.ledger.get_effect(consumer, eid_1)
+        self.assertEqual(rec1["details"]["blocked_reason"], BLOCKED_UNCERTAIN_EFFECT)
+
+        # Effect 2 remains DELIVERED
+        self.assertEqual(self.ledger.get_effect_status(consumer, eid_2), STATE_DELIVERED)
+
+    def test_wal_full_synchronous_durability(self) -> None:
+        """Verify WAL mode and synchronous=FULL durability settings for power-loss safety."""
+        with self.ledger._connection() as conn:
+            journal_mode = conn.execute("PRAGMA journal_mode;").fetchone()[0]
+            sync_mode = conn.execute("PRAGMA synchronous;").fetchone()[0]
+            self.assertEqual(journal_mode.lower(), "wal")
+            # In SQLite, PRAGMA synchronous = 2 corresponds to FULL
+            self.assertEqual(int(sync_mode), 2)
 
 
 class MockCoreClientForEFB(CoreClient):
@@ -526,6 +606,284 @@ class TestEFBGracefulShutdown(unittest.TestCase):
         # Poll thread MUST have terminated in under 2.0 seconds
         self.assertFalse(poll_thread.is_alive(), f"Poll thread did not terminate within 2s; took {elapsed:.2f}s")
         self.assertLess(elapsed, 2.0)
+
+
+class TestDeterministicFailureInjection(unittest.TestCase):
+    """Deterministic failure injection tests covering all 6 mandatory failure scenarios."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.data_path = Path(self.temp_dir.name)
+        self.mock_core = MockCoreClientForEFB()
+        self.delivered_messages: List[Message] = []
+
+        self.orig_master = getattr(coordinator, "master", None)
+        self.orig_send_message = getattr(coordinator, "send_message", None)
+        coordinator.master = mock.MagicMock()
+        coordinator.send_message = self.delivered_messages.append
+
+    def tearDown(self) -> None:
+        coordinator.master = self.orig_master
+        coordinator.send_message = self.orig_send_message
+        self.temp_dir.cleanup()
+
+    def _create_channel(self) -> LinuxWeChatChannel:
+        return LinuxWeChatChannel(
+            core_client=self.mock_core,
+            config={
+                "core": {"base_url": "http://mock-core", "timeout": 5.0},
+                "poll_interval": 0.05,
+                "startup_healthcheck": False,
+            },
+            data_path=self.data_path,
+        )
+
+    def test_scenario_1_crash_before_reservation(self) -> None:
+        """Scenario 1: Crash before reservation. No ledger row created; redelivery delivers normally."""
+        channel = self._create_channel()
+        ev = {
+            "event_id": "ev-sc1",
+            "cursor": 100,
+            "event_type": "message.created",
+            "account_id": "acc-1",
+            "payload": {
+                "message": {"message_id": "msg-sc1", "chat_id": "chat-1", "text": "Sc1 test", "type": "text"}
+            },
+        }
+
+        class InjectedCrash(Exception):
+            pass
+
+        with mock.patch.object(channel.effect_ledger, "reserve_effect", side_effect=InjectedCrash("Simulated crash before reservation")):
+            with self.assertRaises(InjectedCrash):
+                channel._handle_event(ev)
+
+        self.assertEqual(len(self.delivered_messages), 0)
+        effect_id = channel.effect_ledger.compute_effect_id("acc-1", "msg-sc1")
+        self.assertIsNone(channel.effect_ledger.get_effect_status(channel.consumer_id, effect_id))
+
+        channel.stop_polling()
+        channel.effect_ledger.close()
+
+        channel_restarted = self._create_channel()
+        try:
+            channel_restarted._handle_event(ev)
+            self.assertEqual(len(self.delivered_messages), 1)
+            self.assertEqual(
+                channel_restarted.effect_ledger.get_effect_status(channel_restarted.consumer_id, effect_id),
+                STATE_DELIVERED,
+            )
+        finally:
+            channel_restarted.stop_polling()
+            channel_restarted.effect_ledger.close()
+
+    def test_scenario_2_crash_after_reservation_before_external_call(self) -> None:
+        """Scenario 2: Crash after reservation before external call.
+        
+        Reservation was persisted (RESERVED). Process crashed before _deliver_message.
+        On restart, reconciliation marks RESERVED -> UNCERTAIN.
+        When event is redelivered, send is suppressed (fail-closed, BLOCKED_UNCERTAIN_EFFECT).
+        Zero external deliveries occur!
+        """
+        channel = self._create_channel()
+        ev = {
+            "event_id": "ev-sc2",
+            "cursor": 200,
+            "event_type": "message.created",
+            "account_id": "acc-1",
+            "payload": {
+                "message": {"message_id": "msg-sc2", "chat_id": "chat-1", "text": "Sc2 test", "type": "text"}
+            },
+        }
+
+        class InjectedCrash(Exception):
+            pass
+
+        with mock.patch.object(channel, "_deliver_message", side_effect=InjectedCrash("Crash before external delivery")):
+            with self.assertRaises(InjectedCrash):
+                channel._handle_event(ev)
+
+        self.assertEqual(len(self.delivered_messages), 0)
+        effect_id = channel.effect_ledger.compute_effect_id("acc-1", "msg-sc2")
+        self.assertEqual(
+            channel.effect_ledger.get_effect_status(channel.consumer_id, effect_id),
+            STATE_UNCERTAIN,
+        )
+
+        channel.stop_polling()
+        channel.effect_ledger.close()
+
+        channel_restarted = self._create_channel()
+        try:
+            channel_restarted._handle_event(ev)
+            self.assertEqual(len(self.delivered_messages), 0)
+        finally:
+            channel_restarted.stop_polling()
+            channel_restarted.effect_ledger.close()
+
+    def test_scenario_3_crash_immediately_after_external_delivery_before_ledger_finalize(self) -> None:
+        """Scenario 3: CRUCIAL CRASH WINDOW.
+        
+        External delivery succeeded, but process crashed before mark_delivered executed!
+        On disk, effect ledger is in RESERVED state.
+        On restart, reconciliation transitions RESERVED to UNCERTAIN (BLOCKED_UNCERTAIN_EFFECT).
+        When Core re-delivers the event (e.g. cursor lag), EFB suppresses re-sending.
+        Guarantees ZERO DUPLICATE DELIVERIES to external master!
+        """
+        channel = self._create_channel()
+        ev = {
+            "event_id": "ev-sc3",
+            "cursor": 300,
+            "event_type": "message.created",
+            "account_id": "acc-1",
+            "payload": {
+                "message": {"message_id": "msg-sc3", "chat_id": "chat-1", "text": "Sc3 test", "type": "text"}
+            },
+        }
+
+        class ProcessCrashBeforeFinalize(Exception):
+            pass
+
+        with mock.patch.object(channel.effect_ledger, "mark_delivered", side_effect=ProcessCrashBeforeFinalize("Power loss before finalize")):
+            with self.assertRaises(ProcessCrashBeforeFinalize):
+                channel._handle_event(ev)
+
+        self.assertEqual(len(self.delivered_messages), 1)
+
+        effect_id = channel.effect_ledger.compute_effect_id("acc-1", "msg-sc3")
+        self.assertEqual(
+            channel.effect_ledger.get_effect_status(channel.consumer_id, effect_id),
+            STATE_RESERVED,
+        )
+
+        channel.stop_polling()
+        channel.effect_ledger.close()
+
+        # Restart after crash
+        channel_restarted = self._create_channel()
+        try:
+            self.assertEqual(
+                channel_restarted.effect_ledger.get_effect_status(channel_restarted.consumer_id, effect_id),
+                STATE_UNCERTAIN,
+            )
+
+            # Core redelivers the event
+            channel_restarted._handle_event(ev)
+
+            # CRITICAL: delivered_messages count MUST STILL BE 1!
+            self.assertEqual(len(self.delivered_messages), 1)
+        finally:
+            channel_restarted.stop_polling()
+            channel_restarted.effect_ledger.close()
+
+    def test_scenario_4_crash_after_delivered_before_cursor_save(self) -> None:
+        """Scenario 4: Crash after DELIVERED before cursor save.
+        
+        Ledger holds DELIVERED. On restart, Core redelivers event from old cursor.
+        Ledger absorbs duplicate cleanly. Delivery count remains exactly 1.
+        """
+        channel = self._create_channel()
+        ev = {
+            "event_id": "ev-sc4",
+            "cursor": 400,
+            "event_type": "message.created",
+            "account_id": "acc-1",
+            "payload": {
+                "message": {"message_id": "msg-sc4", "chat_id": "chat-1", "text": "Sc4 test", "type": "text"}
+            },
+        }
+
+        channel._handle_event(ev)
+        self.assertEqual(len(self.delivered_messages), 1)
+        effect_id = channel.effect_ledger.compute_effect_id("acc-1", "msg-sc4")
+        self.assertEqual(
+            channel.effect_ledger.get_effect_status(channel.consumer_id, effect_id),
+            STATE_DELIVERED,
+        )
+
+        channel.stop_polling()
+        channel.effect_ledger.close()
+
+        channel_restarted = self._create_channel()
+        try:
+            channel_restarted._handle_event(ev)
+            self.assertEqual(len(self.delivered_messages), 1)
+        finally:
+            channel_restarted.stop_polling()
+            channel_restarted.effect_ledger.close()
+
+    def test_scenario_5_duplicate_core_message_created(self) -> None:
+        """Scenario 5: Core emits duplicate message.created events.
+        
+        Ledger absorbs duplicate in real-time. Delivery count is 1.
+        """
+        channel = self._create_channel()
+        try:
+            ev1 = {
+                "event_id": "ev-sc5-1",
+                "cursor": 501,
+                "event_type": "message.created",
+                "account_id": "acc-1",
+                "payload": {
+                    "message": {"message_id": "msg-sc5", "chat_id": "chat-1", "text": "Sc5 dup", "type": "text"}
+                },
+            }
+            ev2 = copy.deepcopy(ev1)
+            ev2["event_id"] = "ev-sc5-2"
+            ev2["cursor"] = 502
+
+            channel._handle_event(ev1)
+            self.assertEqual(len(self.delivered_messages), 1)
+
+            channel._handle_event(ev2)
+            self.assertEqual(len(self.delivered_messages), 1)
+        finally:
+            channel.stop_polling()
+            channel.effect_ledger.close()
+
+    def test_scenario_6_restart_with_reserved_and_uncertain_states(self) -> None:
+        """Scenario 6: Restart with pre-existing RESERVED and UNCERTAIN states.
+        
+        Reconciliation handles RESERVED -> UNCERTAIN transition.
+        Both RESERVED and UNCERTAIN fail closed on event arrival.
+        """
+        ledger = EffectLedger(self.data_path / "core-effect-ledger.sqlite3")
+        consumer = "efb-linux-wechat:wechat.linux"
+        eid_res = ledger.compute_effect_id("acc-1", "msg-pre-res")
+        eid_unc = ledger.compute_effect_id("acc-1", "msg-pre-unc")
+
+        ledger.reserve_effect(consumer, eid_res, account_id="acc-1", message_id="msg-pre-res")
+        ledger.reserve_effect(consumer, eid_unc, account_id="acc-1", message_id="msg-pre-unc")
+        ledger.mark_uncertain(consumer, eid_unc, reason="Prior crash")
+        ledger.close()
+
+        channel = self._create_channel()
+        try:
+            self.assertEqual(channel.effect_ledger.get_effect_status(consumer, eid_res), STATE_UNCERTAIN)
+            self.assertEqual(channel.effect_ledger.get_effect_status(consumer, eid_unc), STATE_UNCERTAIN)
+
+            ev_res = {
+                "event_id": "ev-res",
+                "cursor": 601,
+                "event_type": "message.created",
+                "account_id": "acc-1",
+                "payload": {"message": {"message_id": "msg-pre-res", "chat_id": "c1", "text": "T", "type": "text"}},
+            }
+            ev_unc = {
+                "event_id": "ev-unc",
+                "cursor": 602,
+                "event_type": "message.created",
+                "account_id": "acc-1",
+                "payload": {"message": {"message_id": "msg-pre-unc", "chat_id": "c1", "text": "T", "type": "text"}},
+            }
+
+            channel._handle_event(ev_res)
+            channel._handle_event(ev_unc)
+
+            self.assertEqual(len(self.delivered_messages), 0)
+        finally:
+            channel.stop_polling()
+            channel.effect_ledger.close()
 
 
 if __name__ == "__main__":
