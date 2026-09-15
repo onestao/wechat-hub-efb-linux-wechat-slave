@@ -101,10 +101,56 @@ class CoreMessageBuilder:
                 result[(start, end)] = chat.self
         return Substitutions(result) if result else None
 
+    @staticmethod
+    def _bool_value(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "self", "outgoing"}
+        return bool(value)
+
+    def _author_data(self, message: Mapping[str, Any], account_id: str) -> Dict[str, Any]:
+        nested = message.get("author") if isinstance(message.get("author"), Mapping) else {}
+        sender_id = str(
+            message.get("sender_id")
+            or nested.get("sender_id")
+            or nested.get("member_id")
+            or ""
+        )
+        sender_name = str(
+            message.get("sender_name")
+            or nested.get("sender_name")
+            or nested.get("display_name")
+            or sender_id
+            or "Unknown"
+        )
+        if "is_self" in message:
+            is_self = self._bool_value(message.get("is_self"))
+        elif "is_self" in nested:
+            is_self = self._bool_value(nested.get("is_self"))
+        else:
+            direction = str(message.get("direction") or "").strip().lower()
+            if direction not in {"incoming", "outgoing"}:
+                raise ValueError("Core message has no reliable is_self or direction identity")
+            is_self = direction == "outgoing"
+        if not sender_id:
+            if is_self:
+                sender_id = account_id
+            else:
+                raise ValueError("Non-self Core message has no stable sender_id")
+        return {
+            "member_id": sender_id,
+            "display_name": sender_name,
+            "alias": nested.get("alias"),
+            "is_self": is_self,
+        }
+
     def build(self, message: Mapping[str, Any], chat: Chat) -> Message:
         account_id = str(message.get("account_id") or "")
         message_id = str(message.get("message_id") or "")
-        author_data = message.get("author") if isinstance(message.get("author"), dict) else {}
+        author_data = self._author_data(message, account_id)
         author = self.chats.upsert_author(chat, account_id, author_data)
         msg_type = str(message.get("type") or "unsupported")
         text = str(message.get("text") or "")
@@ -114,6 +160,9 @@ class CoreMessageBuilder:
                 "chat_id": str(message.get("chat_id") or ""),
                 "message_id": message_id,
                 "direction": str(message.get("direction") or ""),
+                "sender_id": author_data["member_id"],
+                "sender_name": author_data["display_name"],
+                "is_self": author_data["is_self"],
                 "created_at": message.get("created_at"),
                 "attributes": dict(message.get("attributes") or {}),
                 "message": dict(message.get("vendor_specific") or {}),

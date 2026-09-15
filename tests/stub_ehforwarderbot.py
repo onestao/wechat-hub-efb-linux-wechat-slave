@@ -53,6 +53,23 @@ class GroupChat(Chat):
         super().__init__(*args, **kwargs)
         self.members: List[ChatMember] = []
 
+    def get_member(self, uid: str) -> ChatMember:
+        for member in self.members:
+            if str(member.uid) == str(uid):
+                return member
+        raise KeyError(uid)
+
+    def add_member(self, uid: str, name: str, alias: Optional[str] = None, vendor_specific: Optional[Dict[str, Any]] = None) -> ChatMember:
+        member = ChatMember(
+            uid=uid,
+            name=name,
+            alias=alias,
+            channel=self.channel,
+            vendor_specific=vendor_specific,
+        )
+        self.members.append(member)
+        return member
+
 
 class PrivateChat(Chat):
     def __init__(self, *args: Any, **kwargs: Any):
@@ -61,7 +78,24 @@ class PrivateChat(Chat):
 
 
 class SystemChat(Chat):
-    pass
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.members: List[ChatMember] = []
+
+    def get_member(self, uid: str) -> ChatMember:
+        for member in self.members:
+            if str(member.uid) == str(uid):
+                return member
+        raise KeyError(uid)
+
+    def add_system_member(self) -> ChatMember:
+        member = SystemChatMember(
+            uid=SystemChatMember.SYSTEM_ID,
+            name="System",
+            channel=self.channel,
+        )
+        self.members.append(member)
+        return member
 
 
 class ChatMember:
@@ -74,7 +108,7 @@ class ChatMember:
 
 
 class SystemChatMember(ChatMember):
-    pass
+    SYSTEM_ID = "__system__"
 
 
 class Message:
