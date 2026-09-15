@@ -20,6 +20,18 @@ from .ChatMgr import ChatMgr
 from .Core import CoreClient
 
 
+class MediaSelectionError(RuntimeError):
+    """Core media cannot be used as the requested final artifact."""
+
+
+class MediaPendingError(MediaSelectionError):
+    """The original media artifact is not ready yet and may be retried."""
+
+
+class MediaPermanentError(MediaSelectionError):
+    """The original media artifact failed permanently and must not fall back."""
+
+
 class CoreMessageBuilder:
     def __init__(self, core: CoreClient, chats: ChatMgr) -> None:
         self.core = core
@@ -33,6 +45,16 @@ class CoreMessageBuilder:
         mime_type: Optional[str],
     ) -> Tuple[Any, str, str, Path]:
         media = self.core.get_media(account_id, media_id)
+        if media.role != "original":
+            raise MediaPermanentError(
+                f"Core returned media role {media.role!r} for {media_id}; expected 'original'"
+            )
+        if media.status != "ready":
+            raise MediaPendingError(
+                f"Core returned original media {media_id} with status {media.status!r}; expected 'ready'"
+            )
+        if not media.content:
+            raise MediaPermanentError(f"Core returned an empty original media artifact for {media_id}")
         final_name = filename or media.filename or media_id
         final_mime = mime_type or media.mime_type or mimetypes.guess_type(final_name)[0] or "application/octet-stream"
         suffix = Path(final_name).suffix
@@ -147,20 +169,32 @@ class CoreMessageBuilder:
 
         if efb_msg.type in {MsgType.Image, MsgType.Sticker, MsgType.Voice, MsgType.Video, MsgType.File}:
             media_id = str(message.get("media_id") or "")
+            media_role = str(message.get("media_role") or "")
+            media_status = str(message.get("media_status") or "")
             if not media_id:
-                efb_msg.type = MsgType.Unsupported
-                efb_msg.text = efb_msg.text or f"[{msg_type} media is not ready]"
-            else:
-                file_obj, filename, mime_type, path = self._media_file(
-                    account_id,
-                    media_id,
-                    str(message.get("filename") or "") or None,
-                    str(message.get("mime_type") or "") or None,
+                raise MediaPendingError(f"{msg_type} original media reference is not available")
+            if media_role != "original":
+                raise MediaPermanentError(
+                    f"{msg_type} media {media_id} has role {media_role!r}; thumbnail cannot be final"
                 )
-                efb_msg.file = file_obj
-                efb_msg.filename = filename
-                efb_msg.mime = mime_type
-                efb_msg.path = path
+            if media_status != "ready":
+                if media_status in {"decode_failed", "encrypted_or_unknown", "unsupported_hevc"}:
+                    raise MediaPermanentError(
+                        f"{msg_type} original media {media_id} failed with status {media_status!r}"
+                    )
+                raise MediaPendingError(
+                    f"{msg_type} original media {media_id} is not ready (status={media_status!r})"
+                )
+            file_obj, filename, mime_type, path = self._media_file(
+                account_id,
+                media_id,
+                str(message.get("filename") or "") or None,
+                str(message.get("mime_type") or "") or None,
+            )
+            efb_msg.file = file_obj
+            efb_msg.filename = filename
+            efb_msg.mime = mime_type
+            efb_msg.path = path
 
         substitutions = self._substitutions(message, chat, account_id)
         if substitutions:

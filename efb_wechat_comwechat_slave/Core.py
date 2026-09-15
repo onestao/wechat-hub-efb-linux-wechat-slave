@@ -50,6 +50,8 @@ class CoreMedia:
     mime_type: str
     filename: Optional[str]
     media_id: str
+    role: str
+    status: str
 
 
 class CoreClient:
@@ -269,6 +271,8 @@ class CoreClient:
             mime_type=content_type or "application/octet-stream",
             filename=filename,
             media_id=response.headers.get("X-Media-Id", media_id),
+            role=str(response.headers.get("X-Media-Role") or ""),
+            status=str(response.headers.get("X-Media-Status") or ""),
         )
 
     def _send(self, kind: str, payload: Mapping[str, Any], idempotency_key: str) -> Dict[str, Any]:
