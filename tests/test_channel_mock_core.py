@@ -10,11 +10,11 @@ from pathlib import Path
 from unittest import mock
 
 from ehforwarderbot import Message, MsgType, coordinator
-from ehforwarderbot.exceptions import EFBChatNotFound, EFBOperationNotSupported
+from ehforwarderbot.exceptions import EFBChatNotFound, EFBMessageError, EFBOperationNotSupported
 from ehforwarderbot.status import MessageRemoval
 
 from efb_wechat_comwechat_slave.ComWechat import LinuxWeChatChannel
-from efb_wechat_comwechat_slave.Core import CoreClient
+from efb_wechat_comwechat_slave.Core import CoreClient, CoreMedia
 from efb_wechat_comwechat_slave.UID import decode_chat_uid
 
 
@@ -43,6 +43,11 @@ class MockCoreChannelIntegrationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.state = MOCK_CORE.MockCoreState()
+        for event in cls.state.events:
+            message = event.get("payload", {}).get("message", {})
+            if message.get("media_id") == "media-image-1":
+                message["media_role"] = "original"
+                message["media_status"] = "ready"
         cls.server = MOCK_CORE.create_server("127.0.0.1", 0, cls.state)
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
@@ -104,6 +109,15 @@ class MockCoreChannelIntegrationTest(unittest.TestCase):
 
     def test_text_send_preserves_reply_target_for_core(self):
         chat = self._chat("account-alpha", "alpha-private-1")
+        self.channel.message_mapping.record(
+            self.channel.consumer_id,
+            "account-alpha",
+            "alpha-private-1",
+            "alpha-msg-1",
+            core_message_id="alpha-msg-1",
+            direction="incoming",
+            sender_identity="alice",
+        )
         target = Message(chat=chat, uid="alpha-msg-1", type=MsgType.Text, text="old")
         outgoing = Message(chat=chat, type=MsgType.Text, text="reply", target=target)
         sent = self.channel.send_message(outgoing)
@@ -316,16 +330,15 @@ class MockCoreChannelIntegrationTest(unittest.TestCase):
         self.assertEqual("alpha-outgoing-echo-1", restarted.echo_store.core_message_id(send_id))
         restarted.stop_polling()
 
-    def test_cross_chat_reply_uses_visible_quote_fallback(self):
+    def test_cross_chat_reply_fails_closed(self):
         alpha = self._chat("account-alpha", "alpha-private-1")
         beta = self._chat("account-beta", "beta-private-1")
         target = Message(chat=beta, uid="beta-msg-1", type=MsgType.Text, text="from beta")
         outgoing = Message(chat=alpha, type=MsgType.Text, text="reply", target=target)
-        self.channel.send_message(outgoing)
-        request = self.state.sends[-1]["request"]
-        self.assertNotIn("target_message_id", request)
-        self.assertIn("from beta", request["text"])
-        self.assertIn("reply", request["text"])
+        before = len(self.state.sends)
+        with self.assertRaises(EFBMessageError):
+            self.channel.send_message(outgoing)
+        self.assertEqual(before, len(self.state.sends))
 
     def test_image_and_file_sends_use_core_media_operations(self):
         chat = self._chat("account-alpha", "alpha-private-1")
@@ -358,7 +371,16 @@ class MockCoreChannelIntegrationTest(unittest.TestCase):
             delivered.append(message)
 
         self.channel._deliver_message = capture  # deterministic local delivery boundary
-        processed = self.channel.poll_once()
+        media = CoreMedia(
+            MOCK_CORE.SAMPLE_PNG,
+            "image/png",
+            "one-pixel.png",
+            "media-image-1",
+            "original",
+            "ready",
+        )
+        with mock.patch.object(self.channel.core, "get_media", return_value=media):
+            processed = self.channel.poll_once()
         self.assertEqual(3, processed)
         self.assertEqual("3", self.channel.cursor_store.load())
         self.assertEqual([MsgType.Text, MsgType.Image], [message.type for message in delivered])

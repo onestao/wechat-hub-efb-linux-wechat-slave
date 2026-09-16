@@ -367,6 +367,12 @@ class TestEFBReplaySafetyAndLifecycle(unittest.TestCase):
                         "chat_id": "chat-1",
                         "text": "Hello World",
                         "type": "text",
+                        "direction": "incoming",
+                        "author": {
+                            "member_id": "peer-1",
+                            "display_name": "Peer",
+                            "is_self": False,
+                        },
                     }
                 },
             }
@@ -407,7 +413,11 @@ class TestEFBReplaySafetyAndLifecycle(unittest.TestCase):
             "event_type": "message.created",
             "account_id": "acc-1",
             "payload": {
-                "message": {"message_id": "msg-1", "chat_id": "chat-1", "text": "Msg 1", "type": "text"}
+                "message": {
+                    "message_id": "msg-1", "chat_id": "chat-1", "text": "Msg 1", "type": "text",
+                    "direction": "incoming",
+                    "author": {"member_id": "peer-1", "display_name": "Peer", "is_self": False},
+                }
             },
         }
         ev2 = {
@@ -416,7 +426,11 @@ class TestEFBReplaySafetyAndLifecycle(unittest.TestCase):
             "event_type": "message.created",
             "account_id": "acc-1",
             "payload": {
-                "message": {"message_id": "msg-2", "chat_id": "chat-1", "text": "Msg 2", "type": "text"}
+                "message": {
+                    "message_id": "msg-2", "chat_id": "chat-1", "text": "Msg 2", "type": "text",
+                    "direction": "incoming",
+                    "author": {"member_id": "peer-1", "display_name": "Peer", "is_self": False},
+                }
             },
         }
         self.mock_core.stream_head = 2
@@ -451,7 +465,11 @@ class TestEFBReplaySafetyAndLifecycle(unittest.TestCase):
                 "event_type": "message.created",
                 "account_id": "acc-1",
                 "payload": {
-                    "message": {"message_id": "msg-crash", "chat_id": "chat-1", "text": "Pre-crash", "type": "text"}
+                    "message": {
+                        "message_id": "msg-crash", "chat_id": "chat-1", "text": "Pre-crash", "type": "text",
+                        "direction": "incoming",
+                        "author": {"member_id": "peer-1", "display_name": "Peer", "is_self": False},
+                    }
                 },
             }
             # Deliver directly
@@ -489,7 +507,11 @@ class TestEFBReplaySafetyAndLifecycle(unittest.TestCase):
                     "event_type": "message.created",
                     "account_id": "acc-1",
                     "payload": {
-                        "message": {"message_id": "msg-new", "chat_id": "chat-1", "text": "New", "type": "text"}
+                        "message": {
+                            "message_id": "msg-new", "chat_id": "chat-1", "text": "New", "type": "text",
+                            "direction": "incoming",
+                            "author": {"member_id": "peer-1", "display_name": "Peer", "is_self": False},
+                        }
                     },
                 }
             ]
@@ -647,7 +669,11 @@ class TestDeterministicFailureInjection(unittest.TestCase):
             "event_type": "message.created",
             "account_id": "acc-1",
             "payload": {
-                "message": {"message_id": "msg-sc1", "chat_id": "chat-1", "text": "Sc1 test", "type": "text"}
+                "message": {
+                    "message_id": "msg-sc1", "chat_id": "chat-1", "text": "Sc1 test", "type": "text",
+                    "direction": "incoming",
+                    "author": {"member_id": "peer-1", "display_name": "Peer", "is_self": False},
+                }
             },
         }
 
@@ -692,7 +718,11 @@ class TestDeterministicFailureInjection(unittest.TestCase):
             "event_type": "message.created",
             "account_id": "acc-1",
             "payload": {
-                "message": {"message_id": "msg-sc2", "chat_id": "chat-1", "text": "Sc2 test", "type": "text"}
+                "message": {
+                    "message_id": "msg-sc2", "chat_id": "chat-1", "text": "Sc2 test", "type": "text",
+                    "direction": "incoming",
+                    "author": {"member_id": "peer-1", "display_name": "Peer", "is_self": False},
+                }
             },
         }
 
@@ -737,7 +767,11 @@ class TestDeterministicFailureInjection(unittest.TestCase):
             "event_type": "message.created",
             "account_id": "acc-1",
             "payload": {
-                "message": {"message_id": "msg-sc3", "chat_id": "chat-1", "text": "Sc3 test", "type": "text"}
+                "message": {
+                    "message_id": "msg-sc3", "chat_id": "chat-1", "text": "Sc3 test", "type": "text",
+                    "direction": "incoming",
+                    "author": {"member_id": "peer-1", "display_name": "Peer", "is_self": False},
+                }
             },
         }
 
@@ -789,7 +823,11 @@ class TestDeterministicFailureInjection(unittest.TestCase):
             "event_type": "message.created",
             "account_id": "acc-1",
             "payload": {
-                "message": {"message_id": "msg-sc4", "chat_id": "chat-1", "text": "Sc4 test", "type": "text"}
+                "message": {
+                    "message_id": "msg-sc4", "chat_id": "chat-1", "text": "Sc4 test", "type": "text",
+                    "direction": "incoming",
+                    "author": {"member_id": "peer-1", "display_name": "Peer", "is_self": False},
+                }
             },
         }
 
@@ -825,7 +863,11 @@ class TestDeterministicFailureInjection(unittest.TestCase):
                 "event_type": "message.created",
                 "account_id": "acc-1",
                 "payload": {
-                    "message": {"message_id": "msg-sc5", "chat_id": "chat-1", "text": "Sc5 dup", "type": "text"}
+                    "message": {
+                        "message_id": "msg-sc5", "chat_id": "chat-1", "text": "Sc5 dup", "type": "text",
+                        "direction": "incoming",
+                        "author": {"member_id": "peer-1", "display_name": "Peer", "is_self": False},
+                    }
                 },
             }
             ev2 = copy.deepcopy(ev1)
@@ -867,14 +909,22 @@ class TestDeterministicFailureInjection(unittest.TestCase):
                 "cursor": 601,
                 "event_type": "message.created",
                 "account_id": "acc-1",
-                "payload": {"message": {"message_id": "msg-pre-res", "chat_id": "c1", "text": "T", "type": "text"}},
+                "payload": {"message": {
+                    "message_id": "msg-pre-res", "chat_id": "c1", "text": "T", "type": "text",
+                    "direction": "incoming",
+                    "author": {"member_id": "peer-1", "display_name": "Peer", "is_self": False},
+                }},
             }
             ev_unc = {
                 "event_id": "ev-unc",
                 "cursor": 602,
                 "event_type": "message.created",
                 "account_id": "acc-1",
-                "payload": {"message": {"message_id": "msg-pre-unc", "chat_id": "c1", "text": "T", "type": "text"}},
+                "payload": {"message": {
+                    "message_id": "msg-pre-unc", "chat_id": "c1", "text": "T", "type": "text",
+                    "direction": "incoming",
+                    "author": {"member_id": "peer-1", "display_name": "Peer", "is_self": False},
+                }},
             }
 
             channel._handle_event(ev_res)

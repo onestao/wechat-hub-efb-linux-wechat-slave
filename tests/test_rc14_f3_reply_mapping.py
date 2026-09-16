@@ -10,10 +10,11 @@ TESTS = Path(__file__).resolve().parent
 if str(TESTS) not in sys.path:
     sys.path.insert(0, str(TESTS))
 
-from stub_ehforwarderbot import Message, MsgType, install_stubs
+from stub_ehforwarderbot import install_stubs
 
 install_stubs()
 
+from ehforwarderbot import Message, MsgType
 from ehforwarderbot.exceptions import EFBMessageError
 
 from efb_wechat_comwechat_slave.ComWechat import LinuxWeChatChannel

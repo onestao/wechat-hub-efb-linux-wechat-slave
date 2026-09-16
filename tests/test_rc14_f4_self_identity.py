@@ -10,9 +10,12 @@ TESTS = Path(__file__).resolve().parent
 if str(TESTS) not in sys.path:
     sys.path.insert(0, str(TESTS))
 
-from stub_ehforwarderbot import GroupChat, PrivateChat, install_stubs
+from stub_ehforwarderbot import install_stubs
 
 install_stubs()
+
+from ehforwarderbot.channel import SlaveChannel
+from ehforwarderbot.chat import GroupChat, PrivateChat
 
 from efb_wechat_comwechat_slave.ChatMgr import ChatMgr
 from efb_wechat_comwechat_slave.CoreMessage import CoreMessageBuilder
@@ -23,6 +26,30 @@ class UnusedCore:
     pass
 
 
+class DummySlave(SlaveChannel):
+    channel_name = "RC14 Test"
+    channel_emoji = "T"
+    channel_id = "rc14.test"
+
+    def get_chat(self, chat_uid):
+        return None
+
+    def get_chat_picture(self, chat):
+        raise NotImplementedError
+
+    def get_chats(self):
+        return []
+
+    def poll(self):
+        return None
+
+    def send_message(self, message):
+        return message
+
+    def send_status(self, status):
+        return None
+
+
 class F4SelfIdentityTest(unittest.TestCase):
     def setUp(self) -> None:
         self.data_path = (
@@ -31,7 +58,7 @@ class F4SelfIdentityTest(unittest.TestCase):
             / f"rc14-f4-{uuid.uuid4().hex}"
         )
         self.data_path.mkdir(parents=True, exist_ok=True)
-        self.channel = object()
+        self.channel = DummySlave()
         self.chats = ChatMgr(self.channel)
         self.builder = CoreMessageBuilder(UnusedCore(), self.chats)
 
@@ -186,7 +213,7 @@ class F4SelfIdentityTest(unittest.TestCase):
             core_cursor="901",
         )
 
-        restarted_chats = ChatMgr(object())
+        restarted_chats = ChatMgr(DummySlave())
         restarted_builder = CoreMessageBuilder(UnusedCore(), restarted_chats)
         restarted_chat = restarted_chats.build_core_chat(
             {

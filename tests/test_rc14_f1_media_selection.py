@@ -8,9 +8,12 @@ TESTS = Path(__file__).resolve().parent
 if str(TESTS) not in sys.path:
     sys.path.insert(0, str(TESTS))
 
-from stub_ehforwarderbot import PrivateChat, install_stubs
+from stub_ehforwarderbot import install_stubs
 
 install_stubs()
+
+from ehforwarderbot.channel import SlaveChannel
+from ehforwarderbot.chat import PrivateChat
 
 from efb_wechat_comwechat_slave.ChatMgr import ChatMgr
 from efb_wechat_comwechat_slave.Core import CoreMedia
@@ -19,6 +22,30 @@ from efb_wechat_comwechat_slave.CoreMessage import (
     MediaPendingError,
     MediaPermanentError,
 )
+
+
+class DummySlave(SlaveChannel):
+    channel_name = "RC14 Test"
+    channel_emoji = "T"
+    channel_id = "rc14.test"
+
+    def get_chat(self, chat_uid):
+        return None
+
+    def get_chat_picture(self, chat):
+        raise NotImplementedError
+
+    def get_chats(self):
+        return []
+
+    def poll(self):
+        return None
+
+    def send_message(self, message):
+        return message
+
+    def send_status(self, status):
+        return None
 
 
 class FakeCore:
@@ -34,9 +61,17 @@ class FakeCore:
 class F1OriginalMediaSelectionTest(unittest.TestCase):
     def _builder(self, media: CoreMedia) -> tuple[CoreMessageBuilder, FakeCore, PrivateChat]:
         core = FakeCore(media)
-        channel = object()
+        channel = DummySlave()
         chats = ChatMgr(channel)
-        chat = PrivateChat(channel=channel, uid="chat-1", name="Peer")
+        chat = chats.build_core_chat(
+            {
+                "account_id": "account-1",
+                "chat_id": "peer-1",
+                "type": "private",
+                "display_name": "Peer",
+            },
+            "Self",
+        )
         return CoreMessageBuilder(core, chats), core, chat
 
     @staticmethod

@@ -135,6 +135,8 @@ def sentinel_event(cursor: int = 500) -> Dict[str, Any]:
                 "chat_id": "chat-sentinel",
                 "text": "sentinel body must never be delivered twice",
                 "type": "text",
+                "direction": "incoming",
+                "author": {"member_id": "peer-sentinel", "display_name": "Peer", "is_self": False},
             }
         },
     }
@@ -298,6 +300,12 @@ class CrossRunReplaySentinelTest(unittest.TestCase):
                             "chat_id": "chat-sentinel",
                             "text": "a genuinely new message",
                             "type": "text",
+                            "direction": "incoming",
+                            "author": {
+                                "member_id": "peer-sentinel",
+                                "display_name": "Peer",
+                                "is_self": False,
+                            },
                         }
                     },
                 }

@@ -2,12 +2,34 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import sys
 import tempfile
 import threading
+import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+
+try:
+    import magic  # noqa: F401
+except ImportError:
+    magic_stub = types.ModuleType("magic")
+
+    class _Magic:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def from_buffer(self, *args, **kwargs):
+            return "application/octet-stream"
+
+        def from_file(self, *args, **kwargs):
+            return "application/octet-stream"
+
+    magic_stub.Magic = _Magic
+    magic_stub.from_buffer = lambda *args, **kwargs: "application/octet-stream"
+    magic_stub.from_file = lambda *args, **kwargs: "application/octet-stream"
+    sys.modules["magic"] = magic_stub
 
 import efb_telegram_master
 from ehforwarderbot import Message, MsgType, coordinator
