@@ -821,8 +821,14 @@ class TestShutdownInstallerSafety(ShutdownTestBase):
     @unittest.skipIf(_RealMasterChannel is None, "real ehforwarderbot not installed")
     def test_deferred_installer_installs_when_real_master_appears(self) -> None:
         coordinator.master = None
-        coordinator_obj = ShutdownCoordinator(install_deferred=True, deferred_deadline_sec=5.0)
-        self.assertFalse(coordinator_obj.install())  # arms the deferred installer
+        stale = shutdown_mod.install_shutdown_coordinator(
+            CountingDrainable(), install_deferred=True
+        )
+        coordinator_obj = shutdown_mod.install_shutdown_coordinator(
+            CountingDrainable(), install_deferred=True
+        )
+        self.assertIsNot(stale, coordinator_obj)
+        self.assertFalse(stale.installed)
         self.assertFalse(coordinator_obj.installed)
 
         real_master = RealishMaster()

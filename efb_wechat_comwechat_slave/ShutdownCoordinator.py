@@ -177,6 +177,7 @@ class ShutdownCoordinator:
         self._deferred_deadline_sec = float(deferred_deadline_sec)
         self._deferred_thread: Optional[threading.Thread] = None
         self._installed = False
+        self._registry_key: Optional[str] = None
 
     # ------------------------------------------------------------------ setup
 
@@ -212,20 +213,34 @@ class ShutdownCoordinator:
         master is trusted, so tests and embedders can pass their own object.
         """
         explicit = master is not None
-        if not explicit:
-            candidate = current_master()
-            if not _is_real_master(candidate):
-                # ``ehforwarderbot.__main__.init`` constructs slave channels
-                # *before* the master, so at this point the master usually does
-                # not exist yet.  Arm the deferred installer and report "not yet
-                # installed" -- returning quietly here would disable the whole
-                # corrective in production without any signal.
-                if self._install_deferred:
-                    self._start_deferred_installer()
-                return False
-            master = candidate
-        if master is None:  # pragma: no cover - defensive
+        if explicit:
+            return self._install_master(master)
+
+        registry_key = self._registry_key
+        if registry_key is not None:
+            # A channel reload can replace a coordinator while its deferred
+            # installer thread is still waiting for the master. Hold the
+            # registry lock through resolution and wrapping so a stale
+            # coordinator can never capture the new master.
+            with _REGISTRY_LOCK:
+                if _REGISTRY.get(registry_key) is not self:
+                    return False
+                candidate = current_master()
+                if not _is_real_master(candidate):
+                    if self._install_deferred:
+                        self._start_deferred_installer()
+                    return False
+                return self._install_master(candidate)
+
+        candidate = current_master()
+        if not _is_real_master(candidate):
+            if self._install_deferred:
+                self._start_deferred_installer()
             return False
+        return self._install_master(candidate)
+
+    def _install_master(self, master: Any) -> bool:
+        """Wrap one already-resolved master. Caller owns any registry guard."""
         with self._lock:
             if getattr(master, _WRAPPED_ATTR, None) is self:
                 self._installed = True
@@ -516,6 +531,7 @@ def install_shutdown_coordinator(
             clock=clock,
             exit_func=exit_func,
         )
+        coordinator._registry_key = key
         _REGISTRY[key] = coordinator
 
     # Drain any sibling slave channels registered before this one.
