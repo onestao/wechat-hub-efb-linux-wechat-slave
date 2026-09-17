@@ -218,6 +218,58 @@ class CoreClient:
                 return None
             raise
 
+    def get_message_projection(
+        self,
+        account_id: str,
+        chat_id: str,
+        message_id: str,
+        *,
+        max_pages: int = 2,
+        page_limit: int = 200,
+    ) -> Optional[Dict[str, Any]]:
+        """Read one message's authoritative Core projection by identity.
+
+        Used as the fallback business-provenance source when an event payload does not
+        carry the projection fields. The V1 contract exposes no single-message
+        endpoint, so this is a bounded forward scan of the chat's message index:
+
+        * the scan is capped at ``max_pages`` pages of ``page_limit`` rows;
+        * a message that is not found within the bound returns ``None`` — the caller
+          must fail closed rather than treat "not found" as "pre-existing";
+        * ``CoreAPIError`` / ``CoreUnavailableError`` propagate so the caller can
+          classify the failure as indeterminate and retryable.
+
+        Returns ``None`` when the chat itself is unknown to Core.
+        """
+        pages = max(1, int(max_pages))
+        limit = max(1, min(int(page_limit), 200))
+        cursor = ""
+        for _ in range(pages):
+            params: Dict[str, Any] = {"limit": limit}
+            if cursor:
+                params["cursor"] = cursor
+            path = (
+                f"/v1/accounts/{quote(account_id, safe='')}"
+                f"/chats/{quote(chat_id, safe='')}/messages"
+            )
+            try:
+                payload = self._json(self._request("GET", path, params=params))
+            except CoreAPIError as exc:
+                if exc.status_code == 404:
+                    return None
+                raise
+            messages = payload.get("messages")
+            if not isinstance(messages, list):
+                raise CoreUnavailableError("Core message listing response has no messages list")
+            for item in messages:
+                if isinstance(item, dict) and str(item.get("message_id") or "") == str(message_id):
+                    return item
+            next_cursor = payload.get("next_cursor")
+            if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
+                return None
+            cursor = next_cursor
+        return None
+
     def bootstrap_consumer(
         self,
         consumer_id: str,

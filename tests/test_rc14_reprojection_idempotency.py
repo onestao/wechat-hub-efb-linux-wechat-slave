@@ -67,6 +67,7 @@ except ImportError:
     EFFECT_KIND_DELIVERY = "delivery"
 
 FIXTURE = TESTS / "fixtures" / "rc14_post_f3_reprojection_stream.json"
+PROVENANCE_FIXTURE = TESTS / "fixtures" / "rc14_unknown_identity_provenance.json"
 
 # Sealed census boundaries (see the audit document section 2).
 W1_LAST_CURSOR = 274304
@@ -74,16 +75,59 @@ NEW_BUSINESS_FIRST = 274305
 NEW_BUSINESS_LAST = 274307
 W2_FIRST_CURSOR = 274308
 
+# The immutable production subscription anchor, read from Core's governed bootstrap
+# provenance for consumer `efb-linux-wechat:wechat.linux`
+# (GET /v1/consumers/efb-linux-wechat%3Awechat.linux/bootstrap):
+#   initial_cursor 272037 / bootstrap_mode bounded_window / bootstrap_at 2026-09-15T11:18:09Z
+PRODUCTION_FLOOR = {
+    "consumer_id": "efb-linux-wechat:wechat.linux",
+    "initial_cursor": 272037,
+    "processed_through_cursor": 273844,
+    "bootstrap_mode": "bounded_window",
+    "bootstrap_source": "governed_rebootstrap",
+    "bootstrap_at": "2026-09-15T11:18:09Z",
+    "stream_head_cursor": 274765,
+    "retention_floor_cursor": 1,
+    "audit_history": [],
+}
+
+# A real origin from the W1/W2 re-projection window (cursor 273886) and a real origin
+# from the genuinely new business at 274306.
+PRE_FLOOR_CREATED_AT = "2026-09-01T06:22:51Z"
+POST_FLOOR_CREATED_AT = "2026-09-17T00:30:06Z"
+
 CONSUMER_ID = "rc14-reprojection"
 FIXTURE_ACCOUNTS = ("f-live-a", "testB")
+
+_UNSET = object()
 
 
 class OfflineCore:
     """Offline Core double: no network, no production state."""
 
-    def __init__(self, *, media_ready: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        media_ready: bool = True,
+        bootstrap=_UNSET,
+        bootstrap_error: BaseException | None = None,
+        projection: dict | None = None,
+        projection_error: BaseException | None = None,
+    ) -> None:
         self.media_ready = media_ready
         self.media_calls = 0
+        if bootstrap is _UNSET:
+            self.bootstrap = dict(PRODUCTION_FLOOR)
+        elif bootstrap:
+            self.bootstrap = dict(bootstrap)
+        else:
+            # An explicit None/empty bootstrap models a consumer with no governed
+            # bootstrap provenance at all.
+            self.bootstrap = None
+        self.bootstrap_error = bootstrap_error
+        self.projection = projection
+        self.projection_error = projection_error
+        self.projection_calls = 0
 
     def get_media(self, account_id: str, media_id: str) -> CoreMedia:
         self.media_calls += 1
@@ -106,6 +150,17 @@ class OfflineCore:
         # the Core chat index to resolve a fixture chat.
         return []
 
+    def get_bootstrap_provenance(self, consumer_id: str):
+        if self.bootstrap_error is not None:
+            raise self.bootstrap_error
+        return dict(self.bootstrap) if self.bootstrap else None
+
+    def get_message_projection(self, account_id, chat_id, message_id, **_kwargs):
+        self.projection_calls += 1
+        if self.projection_error is not None:
+            raise self.projection_error
+        return dict(self.projection) if self.projection else None
+
 
 def _load_fixture_rows():
     payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
@@ -113,13 +168,24 @@ def _load_fixture_rows():
     return [dict(zip(columns, row)) for row in payload["rows"]]
 
 
-def _message_from_row(row):
+def _load_provenance_fixture():
+    """Return (floor, {cursor: (occurred_at, created_at)}, ledger_triples)."""
+    payload = json.loads(PROVENANCE_FIXTURE.read_text(encoding="utf-8"))
+    provenance = {str(row[0]): (str(row[1]), str(row[2])) for row in payload["provenance"]}
+    ledger = [(str(row[0]), str(row[1]), str(row[2])) for row in payload["ledger"]]
+    return payload["subscription_floor"], provenance, ledger
+
+
+def _message_from_row(row, provenance=None):
     """Rebuild the Core message dict from a fixture row.
 
     The fixture stores only identity/projection fields, so ``text`` is empty and the
     author is synthesised. ``media_role`` / ``media_status`` are attached **only when
     non-empty**, which faithfully reproduces the two real payload shapes: the pre-F3
     W1 projection omits both keys entirely, and the F3 W2 projection carries both.
+
+    ``created_at`` is attached when the provenance census has it, because it is Core's
+    authoritative business origin and the classification decision depends on it.
     """
     message = {
         "account_id": row["account_id"],
@@ -136,6 +202,10 @@ def _message_from_row(row):
             "is_self": False,
         },
     }
+    if provenance:
+        created_at = provenance.get(str(row["cursor"]), ("", ""))[1]
+        if created_at:
+            message["created_at"] = created_at
     if row["media_id"]:
         message["media_id"] = row["media_id"]
     if row["media_role"]:
@@ -145,7 +215,7 @@ def _message_from_row(row):
     return message
 
 
-def _event_from_row(row):
+def _event_from_row(row, provenance=None):
     event_type = row["event_type"]
     if event_type == "media.ready":
         return {
@@ -171,7 +241,7 @@ def _event_from_row(row):
     return {
         "event_type": event_type,
         "account_id": row["account_id"],
-        "payload": {"message": _message_from_row(row)},
+        "payload": {"message": _message_from_row(row, provenance)},
     }
 
 
@@ -196,8 +266,16 @@ class ReprojectionTestBase(unittest.TestCase):
 
     # ---------------------------------------------------------------- harness
 
-    def _new_channel(self, *, consumer_id: str = CONSUMER_ID, max_attempts: int = 5, media_ready: bool = True):
-        self.core = OfflineCore(media_ready=media_ready)
+    def _new_channel(
+        self,
+        *,
+        consumer_id: str = CONSUMER_ID,
+        max_attempts: int = 5,
+        media_ready: bool = True,
+        core: OfflineCore | None = None,
+        data_path: Path | None = None,
+    ):
+        self.core = core if core is not None else OfflineCore(media_ready=media_ready)
         channel = LinuxWeChatChannel(
             core_client=self.core,
             config={
@@ -211,7 +289,7 @@ class ReprojectionTestBase(unittest.TestCase):
                 "media_retry_max_sec": 0,
                 "core": {"poll_timeout": 0},
             },
-            data_path=self.data_path,
+            data_path=data_path if data_path is not None else self.data_path,
         )
         channel._deliver_message = self._capture
         return channel
@@ -270,6 +348,8 @@ class ReprojectionTestBase(unittest.TestCase):
         media_status: str = "",
         media_id: str = "",
         attributes=None,
+        created_at: str = POST_FLOOR_CREATED_AT,
+        origin_cursor=None,
     ):
         message = {
             "account_id": account_id,
@@ -282,6 +362,10 @@ class ReprojectionTestBase(unittest.TestCase):
             "substitutions": [],
             "author": {"member_id": "peer-1", "display_name": "Peer", "is_self": False},
         }
+        if created_at:
+            message["created_at"] = created_at
+        if origin_cursor is not None:
+            message["origin_cursor"] = origin_cursor
         if media_id:
             message["media_id"] = media_id
         if media_role:
@@ -292,14 +376,21 @@ class ReprojectionTestBase(unittest.TestCase):
             message["attributes"] = attributes
         return message
 
-    def _media_msg(self, message_id: str, *, status: str = "ready", role: str = "original"):
+    def _media_msg(self, message_id: str, *, status: str = "ready", role: str = "original", **kwargs):
         return self._msg(
             message_id=message_id,
             msg_type="image",
             media_id=f"{message_id}-media",
             media_role=role,
             media_status=status,
+            **kwargs,
         )
+
+    def _floor(self, account_id: str = "f-live-a"):
+        return self.channel.subscription_floor.get(account_id)
+
+    def _provenance_counts(self):
+        return dict(self.channel._provenance_counts)
 
 
 class TestSingleMessageIdempotency(ReprojectionTestBase):
@@ -616,36 +707,37 @@ class TestEffectIdentitySchema(ReprojectionTestBase):
 class TestRealW1W2Fixture(ReprojectionTestBase):
     """R14 plus the section 6 zero-effect gates, driven by the real census fixture."""
 
-    def _seed_terminal_split(self, w1_rows):
-        """Seed the sealed historical terminal split: 42 DELIVERED + 27 MEDIA_FAILED.
+    def _seed_real_ledger(self, triples):
+        """Seed the production EffectLedger identity/status snapshot verbatim.
 
-        The sealed evidence fixes the *counts*, not which identities hold them. The
-        selection below is deterministic; the assertions are invariant to it because the
-        fix suppresses every one of the 414 identities regardless of prior state.
+        The snapshot is a read-only copy of the real ledger (417 rows: 375 DELIVERED +
+        42 MEDIA_FAILED, single consumer, sha256 3e0853fb...0fcd). Seeding the real
+        identities — rather than a deterministic stand-in — is what makes the offline
+        replay discriminating: 69 of the window's 414 identities are known terminal
+        state, 345 are not.
         """
-        pairs = sorted({(row["account_id"], row["message_id"]) for row in w1_rows})
-        self.assertEqual(414, len(pairs))
-        delivered = pairs[:42]
-        failed = pairs[42:69]
+        self.assertEqual(417, len(triples))
         ledger = self.channel.effect_ledger
-        for account_id, message_id in delivered:
-            ledger.record_delivered(
-                self.channel.consumer_id,
-                ledger.compute_effect_id(account_id, message_id),
-                account_id=account_id,
-                message_id=message_id,
-                efb_uid=message_id,
-            )
-        for account_id, message_id in failed:
-            ledger.mark_media_failed(
-                self.channel.consumer_id,
-                ledger.compute_effect_id(account_id, message_id),
-                account_id=account_id,
-                message_id=message_id,
-                event_type="message.created",
-                reason="seeded historical terminal state",
-            )
-        return delivered, failed
+        for account_id, message_id, status in triples:
+            if status == STATE_DELIVERED:
+                ledger.record_delivered(
+                    self.channel.consumer_id,
+                    ledger.compute_effect_id(account_id, message_id),
+                    account_id=account_id,
+                    message_id=message_id,
+                    efb_uid=message_id,
+                )
+            else:
+                self.assertEqual(STATE_MEDIA_FAILED, status)
+                ledger.mark_media_failed(
+                    self.channel.consumer_id,
+                    ledger.compute_effect_id(account_id, message_id),
+                    account_id=account_id,
+                    message_id=message_id,
+                    event_type="message.created",
+                    reason="seeded historical terminal state",
+                )
+        return triples
 
     def test_fixture_matches_the_sealed_census(self) -> None:
         rows = _load_fixture_rows()
@@ -674,8 +766,98 @@ class TestRealW1W2Fixture(ReprojectionTestBase):
         self.assertEqual(0, sum(1 for r in w1 if r["media_role"]), "W1 carries no F3 field")
         self.assertEqual(414, sum(1 for r in w2 if r["media_role"]), "W2 carries F3 fields")
 
+    def test_provenance_census_matches_the_read_only_capture(self) -> None:
+        """The provenance fixture must reproduce the read-only Core capture exactly."""
+        floor, provenance, ledger = _load_provenance_fixture()
+        self.assertEqual(883, len(provenance))
+        self.assertEqual(417, len(ledger))
+        self.assertEqual(272037, floor["subscription_floor_cursor"])
+        self.assertEqual("2026-09-15T11:18:09Z", floor["subscription_floor_at"])
+        self.assertEqual("bounded_window", floor["bootstrap_mode"])
+
+        rows = _load_fixture_rows()
+        message_rows = [r for r in rows if r["event_type"].startswith("message")]
+        self.assertEqual(831, len(message_rows))
+        self.assertEqual(
+            0,
+            sum(1 for r in message_rows if not provenance[str(r["cursor"])][1]),
+            "every real message projection carries a business origin",
+        )
+        pre = [r for r in message_rows if provenance[str(r["cursor"])][1] < floor["subscription_floor_at"]]
+        post = [r for r in message_rows if provenance[str(r["cursor"])][1] >= floor["subscription_floor_at"]]
+        self.assertEqual(774, len(pre))
+        self.assertEqual(57, len(post))
+        post_by_type = {}
+        for row in post:
+            post_by_type[row["event_type"]] = post_by_type.get(row["event_type"], 0) + 1
+        self.assertEqual(
+            {"message.created": 3, "message.updated": 54},
+            post_by_type,
+            "post-floor business is overwhelmingly carried by message.updated",
+        )
+        self.assertEqual(
+            27,
+            len({r["message_id"] for r in post if r["event_type"] == "message.updated"}),
+            "54 post-floor updates over 27 distinct objects: the event type cannot be "
+            "the discriminator between new business and a re-projection",
+        )
+        # The event's own occurred_at is NOT a business origin: the 27 post-floor media
+        # objects were created after the floor but re-projected long afterwards, so an
+        # occurred_at comparison would have mislabelled them.
+        self.assertEqual(
+            27,
+            len({r["message_id"] for r in post if r["event_type"] == "message.updated"}),
+        )
+
+    def test_real_ledger_snapshot_partitions_the_window_identities(self) -> None:
+        """69 of the window's 414 identities are terminal; 345 are unknown."""
+        floor, provenance, ledger = _load_provenance_fixture()
+        rows = _load_fixture_rows()
+        window = {
+            (r["account_id"], r["message_id"])
+            for r in rows
+            if r["event_type"] == "message.updated"
+        }
+        self.assertEqual(414, len(window))
+        known = {(a, m) for a, m, _ in ledger}
+        known_window = window & known
+        self.assertEqual(69, len(known_window))
+        statuses = {s for a, m, s in ledger if (a, m) in window}
+        self.assertEqual({STATE_DELIVERED, STATE_MEDIA_FAILED}, statuses)
+        pre_floor = {
+            (r["account_id"], r["message_id"])
+            for r in rows
+            if r["event_type"] == "message.updated"
+            and provenance[str(r["cursor"])][1] < floor["subscription_floor_at"]
+        }
+        post_floor = {
+            (r["account_id"], r["message_id"])
+            for r in rows
+            if r["event_type"] == "message.updated"
+            and provenance[str(r["cursor"])][1] >= floor["subscription_floor_at"]
+        }
+        self.assertEqual(387, len(pre_floor))
+        self.assertEqual(27, len(post_floor))
+        # The 27 post-floor objects are all known MEDIA_FAILED, so they are decided by
+        # the durable state machine; the 345 unknown pre-floor objects are exactly the
+        # re-projections the provenance rule must suppress.
+        self.assertEqual(
+            27,
+            len({(a, m) for a, m, s in ledger if (a, m) in post_floor}),
+        )
+        self.assertEqual(
+            {STATE_MEDIA_FAILED},
+            {s for a, m, s in ledger if (a, m) in post_floor},
+        )
+        self.assertEqual(42, len({(a, m) for a, m, s in ledger if (a, m) in pre_floor}))
+        self.assertEqual(
+            {STATE_DELIVERED},
+            {s for a, m, s in ledger if (a, m) in pre_floor},
+        )
+
     def test_r14_replay_ordering_w1_real_events_w2(self) -> None:
         rows = _load_fixture_rows()
+        floor, provenance, ledger_triples = _load_provenance_fixture()
         for account_id, chat_id in sorted(
             {(r["account_id"], r["chat_id"]) for r in rows if r["chat_id"]}
         ):
@@ -701,27 +883,28 @@ class TestRealW1W2Fixture(ReprojectionTestBase):
         self.assertEqual(3, len(new_business_rows))
         self.assertEqual(420, len(w2_rows))
 
-        self._seed_terminal_split([r for r in w1_rows if r["event_type"] == "message.updated"])
+        self._seed_real_ledger(ledger_triples)
         ledger_before = self._row_count()
-        self.assertEqual(69, ledger_before)
+        self.assertEqual(417, ledger_before)
         statuses_before = self.channel.effect_ledger.status_counts(self.channel.consumer_id)
-        self.assertEqual(42, statuses_before[STATE_DELIVERED])
-        self.assertEqual(27, statuses_before[STATE_MEDIA_FAILED])
+        self.assertEqual(375, statuses_before[STATE_DELIVERED])
+        self.assertEqual(42, statuses_before[STATE_MEDIA_FAILED])
 
         # ---- W1 (pre-F3 re-projection, no media_role / media_status at all) ----
         for row in w1_rows:
-            self.channel._handle_event(_event_from_row(row))
+            self.channel._handle_event(_event_from_row(row, provenance))
         w1_deliveries = len(self.deliveries)
         w1_statuses = self.channel.effect_ledger.status_counts(self.channel.consumer_id)
 
         self.assertEqual(0, w1_deliveries)
-        self.assertEqual(69, self._row_count())
-        self.assertEqual(0, w1_statuses[STATE_MEDIA_FAILED] - 27)
+        self.assertEqual(417, self._row_count())
+        self.assertEqual(42, w1_statuses[STATE_MEDIA_FAILED])
         self.assertEqual(0, w1_statuses[STATE_PENDING_MEDIA])
+        self.assertEqual(0, self.channel.provenance_deferrals.count())
 
         # ---- the three real new business events ----
         for row in new_business_rows:
-            self.channel._handle_event(_event_from_row(row))
+            self.channel._handle_event(_event_from_row(row, provenance))
         new_business_deliveries = len(self.deliveries) - w1_deliveries
 
         self.assertEqual(2, new_business_deliveries)
@@ -736,23 +919,53 @@ class TestRealW1W2Fixture(ReprojectionTestBase):
         # ---- W2 (F3 re-projection, well-formed projection fields) ----
         deliveries_before_w2 = len(self.deliveries)
         rows_before_w2 = self._row_count()
+        statuses_before_w2 = self.channel.effect_ledger.status_counts(self.channel.consumer_id)
         for row in w2_rows:
-            self.channel._handle_event(_event_from_row(row))
+            self.channel._handle_event(_event_from_row(row, provenance))
         w2_deliveries = len(self.deliveries) - deliveries_before_w2
         statuses_after = self.channel.effect_ledger.status_counts(self.channel.consumer_id)
 
         self.assertEqual(0, w2_deliveries)
         self.assertEqual(rows_before_w2, self._row_count())
-        self.assertEqual(27, statuses_after[STATE_MEDIA_FAILED])
+        self.assertEqual(42, statuses_after[STATE_MEDIA_FAILED])
         self.assertEqual(1, statuses_after[STATE_PENDING_MEDIA])
+        self.assertEqual(0, self.channel.provenance_deferrals.count())
 
         # ---- section 6 gates ----
+        # The gates are deltas across the phase they name, so a pre-existing terminal or
+        # pending row carried in from the seeded ledger or from the genuinely-new 274307
+        # object can never be mis-attributed to a re-projection.
         self.assertEqual(0, w1_deliveries, "W1_DUPLICATE_EXTERNAL_DELIVERY")
-        self.assertEqual(0, w1_statuses[STATE_MEDIA_FAILED] - 27, "W1_NEW_MEDIA_FAILED_FROM_REPROJECTION")
-        self.assertEqual(0, w1_statuses[STATE_PENDING_MEDIA], "W1_UNWANTED_PENDING_MEDIA")
+        self.assertEqual(
+            0,
+            w1_statuses[STATE_MEDIA_FAILED] - statuses_before[STATE_MEDIA_FAILED],
+            "W1_NEW_MEDIA_FAILED_FROM_REPROJECTION",
+        )
+        self.assertEqual(
+            0,
+            w1_statuses[STATE_PENDING_MEDIA] - statuses_before[STATE_PENDING_MEDIA],
+            "W1_UNWANTED_PENDING_MEDIA",
+        )
         self.assertEqual(0, w2_deliveries, "W2_DUPLICATE_EXTERNAL_DELIVERY")
-        self.assertEqual(27, statuses_after[STATE_MEDIA_FAILED], "W2_NEW_MEDIA_FAILED_FROM_REPROJECTION")
-        self.assertEqual(1, statuses_after[STATE_PENDING_MEDIA], "W2_UNWANTED_PENDING_MEDIA")
+        self.assertEqual(
+            0,
+            statuses_after[STATE_MEDIA_FAILED] - statuses_before_w2[STATE_MEDIA_FAILED],
+            "W2_NEW_MEDIA_FAILED_FROM_REPROJECTION",
+        )
+        self.assertEqual(
+            0,
+            statuses_after[STATE_PENDING_MEDIA] - statuses_before_w2[STATE_PENDING_MEDIA],
+            "W2_UNWANTED_PENDING_MEDIA",
+        )
+        # Disclosed separately: the one pending row in the ledger is the 274307
+        # file/empty-media_id gap, which the operator ruling keeps as an independent
+        # Core follow-up (FILE_MEDIA_REFERENCE_GAP_CONFIRMED) rather than a
+        # re-projection artefact.
+        self.assertEqual(
+            1,
+            statuses_after[STATE_PENDING_MEDIA],
+            "the single pending row is the known 274307 file gap, not a W2 artefact",
+        )
 
 
 if __name__ == "__main__":

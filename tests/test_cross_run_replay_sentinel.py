@@ -40,6 +40,13 @@ from ehforwarderbot import Message, coordinator  # noqa: E402
 
 from efb_wechat_comwechat_slave.ComWechat import LinuxWeChatChannel  # noqa: E402
 from efb_wechat_comwechat_slave.Core import CoreClient  # noqa: E402
+
+# Subscription anchor / business origin for this suite's Core double. Real Core V1 (F3)
+# reports both from its governed bootstrap provenance and embeds the projection
+# timestamp in every message event; these fixtures predate the unknown-identity
+# hardening, so the double supplies an anchor in the past and an origin after it.
+BOOTSTRAP_AT = "2026-01-01T00:00:00Z"
+PROJECTION_CREATED_AT = "2026-06-01T00:00:00Z"
 from efb_wechat_comwechat_slave.EffectLedger import (  # noqa: E402
     STATE_DELIVERED,
     STATE_RESERVED,
@@ -91,7 +98,27 @@ class OfflineCore(CoreClient):
         return {
             "consumer_id": consumer_id,
             "bootstrap_mode": "bounded_window",
+            "bootstrap_at": BOOTSTRAP_AT,
             "initial_cursor": self.stream_head,
+        }
+
+    def get_message_projection(
+        self,
+        account_id: str,
+        chat_id: str,
+        message_id: str,
+        **_kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Authoritative projection read for the unknown-identity hardening.
+
+        Real Core embeds `created_at` in every message event; these fixtures predate
+        the hardening and omit it, so the double answers the authoritative read.
+        """
+        return {
+            "account_id": account_id,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "created_at": PROJECTION_CREATED_AT,
         }
 
     def bootstrap_consumer(self, consumer_id: str, **kwargs: Any) -> Dict[str, Any]:
@@ -101,6 +128,7 @@ class OfflineCore(CoreClient):
             "consumer_id": consumer_id,
             "initial_cursor": self.stream_head,
             "bootstrap_mode": "bounded_window",
+            "bootstrap_at": BOOTSTRAP_AT,
             "stream_head_cursor": self.stream_head,
         }
 

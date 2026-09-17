@@ -51,6 +51,15 @@ from efb_wechat_comwechat_slave.EffectLedger import (
     EffectLedger,
 )
 
+# Subscription anchor / business origin for this suite's Core double. Real Core V1 (F3)
+# reports both from its governed bootstrap provenance and embeds the projection
+# timestamp in every message event. These fixtures were written before the
+# unknown-identity hardening and carry neither, so the double supplies an anchor in the
+# past and an origin after it: every synthetic message in this suite models genuinely
+# new business, which is what each of these tests already assumed.
+BOOTSTRAP_AT = "2026-01-01T00:00:00Z"
+PROJECTION_CREATED_AT = "2026-06-01T00:00:00Z"
+
 
 class TestEffectLedgerUnit(unittest.TestCase):
     def setUp(self) -> None:
@@ -238,6 +247,26 @@ class MockCoreClientForEFB(CoreClient):
     def get_bootstrap_provenance(self, consumer_id: str) -> Optional[Dict[str, Any]]:
         return self.bootstrap_records.get(consumer_id)
 
+    # -- governed bootstrap provenance / authoritative projection (Core V1 F3) --
+    # The unknown-identity hardening classifies an event whose effect identity is not
+    # yet in the ledger against the durable subscription floor, using Core's
+    # authoritative business origin. Real Core embeds `created_at` in every message
+    # event; these fixtures predate that and omit it, so the double answers the
+    # authoritative read instead of leaving the origin unresolvable.
+    def get_message_projection(
+        self,
+        account_id: str,
+        chat_id: str,
+        message_id: str,
+        **_kwargs: Any,
+    ) -> Dict[str, Any]:
+        return {
+            "account_id": account_id,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "created_at": PROJECTION_CREATED_AT,
+        }
+
     def bootstrap_consumer(
         self,
         consumer_id: str,
@@ -254,6 +283,8 @@ class MockCoreClientForEFB(CoreClient):
             "consumer_id": consumer_id,
             "initial_cursor": init_cursor,
             "mode": mode,
+            "bootstrap_mode": mode,
+            "bootstrap_at": BOOTSTRAP_AT,
             "stream_head_cursor": self.stream_head,
             "audit_history": [{"action": "bootstrap", "initial_cursor": init_cursor, "mode": mode}],
         }
@@ -281,6 +312,8 @@ class MockCoreClientForEFB(CoreClient):
             "initial_cursor": init_cursor,
             "previous_checkpoint": prev,
             "mode": mode,
+            "bootstrap_mode": mode,
+            "bootstrap_at": BOOTSTRAP_AT,
             "stream_head_cursor": self.stream_head,
         }
         self.bootstrap_records[consumer_id] = record
@@ -534,6 +567,8 @@ class TestEFBReplaySafetyAndLifecycle(unittest.TestCase):
         self.mock_core.bootstrap_records["efb-linux-wechat:wechat.linux"] = {
             "initial_cursor": 0,
             "mode": "legacy_unbounded",
+            "bootstrap_mode": "legacy_unbounded",
+            "bootstrap_at": BOOTSTRAP_AT,
         }
 
         # Operator triggers rebootstrap to bounded window (e.g. 500 events from head)

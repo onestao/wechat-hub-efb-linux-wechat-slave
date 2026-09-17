@@ -44,6 +44,27 @@ class DelayedMediaCore:
     def health(self):
         return {"contract_version": 1}
 
+    # -- governed bootstrap provenance (Core V1, part of the F3 contract) -----
+    # The unknown-identity hardening classifies an event whose effect identity is not
+    # yet in the ledger against the durable subscription floor. Real Core always
+    # answers both reads below; the double does too so that these synthetic messages
+    # model new business rather than an unresolvable provenance read.
+    def get_bootstrap_provenance(self, consumer_id: str):
+        return {
+            "consumer_id": consumer_id,
+            "initial_cursor": 0,
+            "bootstrap_mode": "at_head",
+            "bootstrap_at": "2026-01-01T00:00:00Z",
+        }
+
+    def get_message_projection(self, account_id, chat_id, message_id, **_kwargs):
+        return {
+            "account_id": account_id,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "created_at": "2026-06-01T00:00:00Z",
+        }
+
 
 class F2PendingMediaStateMachineTest(unittest.TestCase):
     def setUp(self) -> None:

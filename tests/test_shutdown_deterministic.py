@@ -43,6 +43,13 @@ from ehforwarderbot import Message, MsgType, coordinator  # noqa: E402
 from efb_wechat_comwechat_slave import ShutdownCoordinator as shutdown_mod  # noqa: E402
 from efb_wechat_comwechat_slave.ComWechat import LinuxWeChatChannel  # noqa: E402
 from efb_wechat_comwechat_slave.Core import CoreClient  # noqa: E402
+
+# Subscription anchor / business origin for this suite's Core double. Real Core V1 (F3)
+# reports both from its governed bootstrap provenance and embeds the projection
+# timestamp in every message event; these fixtures predate the unknown-identity
+# hardening, so the double supplies an anchor in the past and an origin after it.
+BOOTSTRAP_AT = "2026-01-01T00:00:00Z"
+PROJECTION_CREATED_AT = "2026-06-01T00:00:00Z"
 from efb_wechat_comwechat_slave.EffectLedger import (  # noqa: E402
     STATE_DELIVERED,
     STATE_RESERVED,
@@ -166,11 +173,32 @@ class RecordingCore(CoreClient):
             "consumer_id": consumer_id,
             "initial_cursor": self.stream_head,
             "bootstrap_mode": mode,
+            "bootstrap_at": BOOTSTRAP_AT,
             "stream_head_cursor": self.stream_head,
         }
         self.bootstrap_records[consumer_id] = record
         self.checkpoints[consumer_id] = self.stream_head
         return record
+
+    def get_message_projection(
+        self,
+        account_id: str,
+        chat_id: str,
+        message_id: str,
+        **_kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Authoritative projection read for the unknown-identity hardening.
+
+        Real Core embeds `created_at` in every message event; this suite's synthetic
+        events predate the hardening and omit it, so the double answers the
+        authoritative read and every synthetic message models new business.
+        """
+        return {
+            "account_id": account_id,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "created_at": PROJECTION_CREATED_AT,
+        }
 
     # -- polling ------------------------------------------------------------
     def poll_events(

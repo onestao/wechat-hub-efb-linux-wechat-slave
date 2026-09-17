@@ -54,6 +54,20 @@ from .ShutdownCoordinator import (
     install_shutdown_coordinator,
 )
 from .MessageMapping import MessageMappingStore
+from .Provenance import (
+    CLASSIFICATION_FIRST_BUSINESS_EFFECT,
+    CLASSIFICATION_INDETERMINATE,
+    CLASSIFICATION_KNOWN_EFFECT,
+    CLASSIFICATION_REPROJECTION_OF_PREEXISTING_OBJECT,
+    PROVENANCE_INDETERMINATE_CORE_READ_ABSENT,
+    PROVENANCE_INDETERMINATE_CORE_READ_FAILED,
+    PROVENANCE_INDETERMINATE_FLOOR_UNAVAILABLE,
+    PROVENANCE_INDETERMINATE_MISSING_CREATED_AT,
+    PROVENANCE_INDETERMINATE_NO_EFFECT_IDENTITY,
+    ProvenanceDeferralStore,
+    SubscriptionFloorStore,
+    extract_business_origin,
+)
 from .UID import InvalidUID, decode_chat_uid
 
 
@@ -80,6 +94,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "shutdown_slave_drain_budget_sec": 0.75,
     "shutdown_hard_exit": True,
     "shutdown_install_deferred": True,
+    # Unknown-identity hardening: durable subscription provenance and the
+    # fail-closed deferral retry budget for an unresolvable business origin.
+    "provenance_core_read_enabled": True,
+    "provenance_core_read_max_pages": 2,
+    "provenance_retry_max_attempts": 5,
+    "provenance_deferral_max_entries": 512,
 }
 
 
@@ -155,6 +175,32 @@ class LinuxWeChatChannel(SlaveChannel):
         self.echo_store = EchoStore(resolved_data_path / "core-send-echo.json")
         self.effect_ledger = EffectLedger(resolved_data_path / "core-effect-ledger.sqlite3")
         self.message_mapping = MessageMappingStore(resolved_data_path / "core-message-mapping.sqlite3")
+        # Unknown-identity hardening (RC.14 EFB reprojection idempotency). Both stores
+        # are additive files of their own: the durable 417-row EffectLedger, the
+        # message mapping DB and the Core checkpoint are never touched by them.
+        self.subscription_floor = SubscriptionFloorStore(
+            resolved_data_path / "core-subscription-floor.json",
+            self.consumer_id,
+            logger=self.logger,
+        )
+        self.provenance_deferrals = ProvenanceDeferralStore(
+            resolved_data_path / "core-provenance-deferrals.json",
+            self.consumer_id,
+            max_attempts=max(1, int(self.config.get("provenance_retry_max_attempts", 5))),
+            max_entries=max(1, int(self.config.get("provenance_deferral_max_entries", 512))),
+            logger=self.logger,
+        )
+        self.provenance_core_read_enabled = bool(
+            self.config.get("provenance_core_read_enabled", True)
+        )
+        self.provenance_core_read_max_pages = max(
+            1, int(self.config.get("provenance_core_read_max_pages", 2))
+        )
+        self._provenance_counts: Dict[str, int] = {
+            CLASSIFICATION_FIRST_BUSINESS_EFFECT: 0,
+            CLASSIFICATION_REPROJECTION_OF_PREEXISTING_OBJECT: 0,
+            CLASSIFICATION_INDETERMINATE: 0,
+        }
         reconciled = self.effect_ledger.reconcile_on_startup(self.consumer_id)
         if reconciled:
             self.logger.warning(
@@ -189,6 +235,19 @@ class LinuxWeChatChannel(SlaveChannel):
             self.logger.info("Cursor aligned with Core initial position: %s", aligned_cursor)
         except Exception as exc:
             self.logger.debug("Could not align cursor during init (will align before first poll): %s", exc)
+
+        try:
+            floor = self._ensure_subscription_floor()
+            self.logger.info(
+                "Subscription floor established: %s",
+                json.dumps(floor, ensure_ascii=False, sort_keys=True),
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "Could not establish the subscription floor during init "
+                "(unknown identities will fail closed until it is available): %s",
+                exc,
+            )
 
         self.logger.info(
             "Linux WeChat Slave initialized: version=%s core=%s accounts=%s",
@@ -325,6 +384,167 @@ class LinuxWeChatChannel(SlaveChannel):
             self.consumer_id,
             default_mode=str(self.config.get("bootstrap_mode") or "at_head"),
         )
+
+    # ------------------------------------------------------------------ #
+    # Unknown-identity hardening (RC.14 EFB reprojection idempotency)
+    # ------------------------------------------------------------------ #
+
+    def _floor_account_scope(self) -> Tuple[str, ...]:
+        """Accounts the durable subscription floor must cover.
+
+        A configured account filter wins. Otherwise the floor is recorded under the
+        wildcard scope so it still applies when Core reports the account list only
+        later, or when Core is unreachable at startup.
+        """
+        if self.account_filter:
+            return tuple(sorted(self.account_filter))
+        try:
+            accounts = {
+                str(account.get("account_id") or "")
+                for account in self.core.list_accounts()
+                if str(account.get("account_id") or "")
+            }
+        except Exception:
+            accounts = set()
+        return tuple(sorted(accounts)) or ("*",)
+
+    def _ensure_subscription_floor(self) -> Dict[str, Any]:
+        """Establish/verify the durable subscription provenance before polling."""
+        return self.subscription_floor.ensure_from_core(
+            self.core,
+            self._floor_account_scope(),
+            allow_core_read=self.provenance_core_read_enabled,
+        )
+
+    def _authoritative_business_origin(
+        self,
+        account_id: str,
+        message: Mapping[str, Any],
+    ) -> Tuple[Any, str]:
+        """Resolve a message's stable business origin from Core's authoritative data.
+
+        The event payload already *is* Core's projection of the object, so it is the
+        first source. When it does not carry a usable origin the authoritative
+        single-message projection is read from Core; a failure there is reported as an
+        indeterminate reason rather than being guessed around.
+        """
+        origin, reason = extract_business_origin(message)
+        if origin is not None:
+            return origin, ""
+        if reason != PROVENANCE_INDETERMINATE_MISSING_CREATED_AT:
+            return None, reason
+        if not self.provenance_core_read_enabled:
+            return None, reason
+        chat_id = str(message.get("chat_id") or "")
+        message_id = str(message.get("message_id") or "")
+        if not chat_id or not message_id:
+            return None, reason
+        try:
+            projection = self.core.get_message_projection(
+                account_id,
+                chat_id,
+                message_id,
+                max_pages=self.provenance_core_read_max_pages,
+            )
+        except CoreError as exc:
+            self.logger.warning(
+                "Core provenance read for %s/%s failed: %s", account_id, message_id, exc
+            )
+            return None, PROVENANCE_INDETERMINATE_CORE_READ_FAILED
+        except Exception as exc:  # noqa: BLE001 - a read failure must never be fatal
+            self.logger.warning(
+                "Core provenance read for %s/%s raised: %s", account_id, message_id, exc
+            )
+            return None, PROVENANCE_INDETERMINATE_CORE_READ_FAILED
+        if not isinstance(projection, Mapping):
+            return None, PROVENANCE_INDETERMINATE_CORE_READ_ABSENT
+        origin, reason = extract_business_origin(projection)
+        if origin is None:
+            return None, reason or PROVENANCE_INDETERMINATE_CORE_READ_ABSENT
+        return origin, ""
+
+    def _classify_unknown_effect(
+        self,
+        account_id: str,
+        message: Mapping[str, Any],
+        *,
+        has_effect_identity: bool,
+    ) -> Tuple[str, str]:
+        """Classify an event whose effect identity is not yet in the ledger.
+
+        Returns ``(classification, reason)``. The decision is a function of the
+        durable subscription floor and Core's authoritative business provenance only:
+        ``event_type`` is not an input, because it describes Core's internal storage
+        transition rather than whether this consumer owes an external effect.
+        """
+        if not has_effect_identity:
+            return CLASSIFICATION_INDETERMINATE, PROVENANCE_INDETERMINATE_NO_EFFECT_IDENTITY
+        origin, reason = self._authoritative_business_origin(account_id, message)
+        floor = self.subscription_floor.get(account_id)
+        if floor is None or not floor.complete:
+            return CLASSIFICATION_INDETERMINATE, PROVENANCE_INDETERMINATE_FLOOR_UNAVAILABLE
+        classification = floor.classify(origin, reason)
+        if classification == CLASSIFICATION_INDETERMINATE and not reason:
+            reason = PROVENANCE_INDETERMINATE_FLOOR_UNAVAILABLE
+        return classification, reason
+
+    def _record_provenance_classification(self, classification: str) -> None:
+        if classification in self._provenance_counts:
+            self._provenance_counts[classification] += 1
+
+    def _defer_provenance(
+        self,
+        account_id: str,
+        message: Mapping[str, Any],
+        event_type: str,
+        *,
+        reason: str,
+    ) -> None:
+        """Park an indeterminate event without any external effect or terminal write."""
+        attempts = self.provenance_deferrals.defer(
+            account_id,
+            message,
+            event_type,
+            reason=reason,
+            cursor=str(message.get("_core_cursor") or ""),
+        )
+        self.logger.warning(
+            "Indeterminate business provenance for %s/%s (%s); failing closed "
+            "(attempt=%d, no external effect, no terminal ledger write)",
+            account_id,
+            str(message.get("message_id") or "<no-identity>"),
+            reason,
+            attempts,
+        )
+
+    def _retry_deferred_provenance(self) -> int:
+        """Re-offer parked indeterminate events to the classifier.
+
+        Called from every poll cycle and on ``media.ready``. An entry that now
+        classifies is dispatched normally and removed from the parking lot; an entry
+        that stays indeterminate keeps its place until its attempt budget is spent.
+        Nothing here produces an external effect on its own.
+        """
+        if self._shutdown_in_progress.is_set():
+            return 0
+        entries = self.provenance_deferrals.due()
+        attempted = 0
+        for entry in entries:
+            raw_message = entry.get("message")
+            if not isinstance(raw_message, Mapping):
+                self.provenance_deferrals.resolve(
+                    str(entry.get("account_id") or ""), str(entry.get("message_id") or "")
+                )
+                continue
+            message = dict(raw_message)
+            message["_core_cursor"] = str(entry.get("cursor") or "")
+            self._handle_message_event(
+                str(entry.get("event_type") or "message.updated"),
+                str(entry.get("account_id") or ""),
+                message,
+            )
+            attempted += 1
+        return attempted
 
     def _health(self) -> Dict[str, Any]:
         payload = self.core.health()
@@ -945,6 +1165,8 @@ class LinuxWeChatChannel(SlaveChannel):
                 current_status,
                 event_type,
             )
+            if core_message_id and self.provenance_deferrals.count():
+                self.provenance_deferrals.resolve(account_id, core_message_id)
             return
         if current_status in {STATE_RESERVED, STATE_UNCERTAIN}:
             self.logger.warning(
@@ -954,20 +1176,42 @@ class LinuxWeChatChannel(SlaveChannel):
                 BLOCKED_UNCERTAIN_EFFECT,
             )
             return
-        # Defect R14-EFB-R2: an update for an identity this consumer never established
-        # is a re-projection of an object that was never delivered to the master — for
-        # example a message created before the governed bootstrap window and re-emitted
-        # above the checkpoint by a Core re-projection pass. Core emits
-        # ``message.created`` for a first projection and ``message.updated`` only for an
-        # object it already holds, so an update must never become a first delivery.
-        # Nothing is written: the decision is a pure function of the durable effect
-        # identity, so a repeated re-projection stays suppressed without polluting the
-        # ledger with synthetic rows.
-        if current_status is None and event_type != "message.created":
+        # Defect R14-EFB-R2, hardened. An event whose effect identity is not yet in the
+        # ledger must be decided from *business provenance*, never from the event type.
+        # ``message.updated`` only says Core already held the row and its digest
+        # changed; it says nothing about whether this consumer owed a delivery. Two
+        # opposite cases arrive under that one event type:
+        #
+        #   * the object predates this consumer's subscription floor — Core is
+        #     re-projecting an object that was never ours to deliver (suppress);
+        #   * the object was created at or after the floor and this consumer has never
+        #     seen it — it is a genuine first business effect (deliver).
+        #
+        # When Core cannot supply the origin, nothing is guessed: no external effect,
+        # no terminal ledger write, and the event is parked for a bounded retry.
+        classification = CLASSIFICATION_KNOWN_EFFECT
+        classification_reason = ""
+        if current_status is None:
+            classification, classification_reason = self._classify_unknown_effect(
+                account_id,
+                message,
+                has_effect_identity=bool(effect_id),
+            )
+            self._record_provenance_classification(classification)
+        if classification == CLASSIFICATION_REPROJECTION_OF_PREEXISTING_OBJECT:
             self.logger.info(
-                "Suppressing projection of unestablished effect %s (event_type=%s)",
+                "Suppressing reprojection of preexisting object %s (event_type=%s, floor=%s)",
                 effect_id or "<no-identity>",
                 event_type,
+                self.subscription_floor.get(account_id),
+            )
+            return
+        if classification == CLASSIFICATION_INDETERMINATE:
+            self._defer_provenance(
+                account_id,
+                message,
+                event_type,
+                reason=classification_reason,
             )
             return
 
@@ -993,9 +1237,12 @@ class LinuxWeChatChannel(SlaveChannel):
                 details={"chat_id": chat_id, "media_status": "ready"},
             )
         elif effect_id:
-            # Reaching this branch means the effect is unestablished and this is a
-            # first projection: every terminal, fail-closed, pending and
-            # unestablished-update combination returned above.
+            # Reaching this branch means the effect identity is unestablished and the
+            # object's business provenance places it at or after the subscription
+            # floor: this is the consumer's first business effect for the object, so it
+            # is reserved and delivered like any other first delivery. Every terminal,
+            # fail-closed, pending, re-projection and indeterminate combination
+            # returned above.
             reserved, reserve_state = self.effect_ledger.reserve_effect(
                 self.consumer_id,
                 effect_id,
@@ -1024,7 +1271,15 @@ class LinuxWeChatChannel(SlaveChannel):
             efb_msg.uid = MessageID(efb_message_id or core_message_id)
         if isinstance(efb_msg.target, Message) and efb_msg.target.uid:
             efb_msg.target.uid = MessageID(self.echo_store.efb_message_id(str(efb_msg.target.uid)))
-        efb_msg.edit = event_type == "message.updated" and current_status != STATE_PENDING_MEDIA
+        # The edit flag is derived from the effect state machine, not from the event
+        # type: a terminal effect is closed above and an effect that reaches this point
+        # is either a first business effect or a pending-media progression, so it is
+        # never an edit of an already-delivered master message.
+        efb_msg.edit = bool(
+            current_status is not None
+            and current_status != STATE_PENDING_MEDIA
+            and classification == CLASSIFICATION_KNOWN_EFFECT
+        )
 
         try:
             self._deliver_message(efb_msg)
@@ -1075,6 +1330,9 @@ class LinuxWeChatChannel(SlaveChannel):
                 event_type=event_type,
                 details={"chat_id": chat_id, "type": str(efb_msg.type)},
             )
+        if core_message_id and self.provenance_deferrals.count():
+            # The event resolved, so it must stop being retried.
+            self.provenance_deferrals.resolve(account_id, core_message_id)
 
     def _retry_pending_media(
         self,
@@ -1156,6 +1414,7 @@ class LinuxWeChatChannel(SlaveChannel):
         elif event_type == "media.ready":
             media = payload.get("media") if isinstance(payload.get("media"), dict) else payload
             self._retry_pending_media(account_id=account_id, ready_media=media)
+            self._retry_deferred_provenance()
         elif event_type == "account.status":
             self.logger.info("Core event %s for %s: %r", event_type, account_id, payload)
         else:
@@ -1196,7 +1455,12 @@ class LinuxWeChatChannel(SlaveChannel):
     def poll_once(self, poll_timeout: Optional[int] = None) -> int:
         """Process one Core event page. Exposed for deterministic integration tests."""
         self._health()
+        if not self.subscription_floor.scoped_accounts():
+            # Core may have been unreachable at construction time; without a durable
+            # floor every unknown identity fails closed, so keep trying to establish it.
+            self._ensure_subscription_floor()
         self._retry_pending_media()
+        self._retry_deferred_provenance()
         cursor = self.cursor_store.load(default=None)
         if cursor is None:
             cursor = self._ensure_bootstrap_aligned()
