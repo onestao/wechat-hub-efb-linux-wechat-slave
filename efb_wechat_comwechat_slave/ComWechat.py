@@ -928,8 +928,23 @@ class LinuxWeChatChannel(SlaveChannel):
             if effect_id
             else None
         )
-        if current_status == STATE_DELIVERED and (event_type == "message.created" or is_media):
-            self.logger.info("Suppressing duplicate delivery for effect %s (DELIVERED)", effect_id)
+        # Terminal effects are closed for every event type.
+        #
+        # Defect R14-EFB-R1: this branch used to be gated on
+        # ``(event_type == "message.created" or is_media)``. A Core re-projection is
+        # delivered as ``message.updated``, so that gate let a non-media replay fall
+        # through to the delivery path and re-open an effect that was already
+        # DELIVERED (a second external delivery) or already MEDIA_FAILED (a second
+        # terminal row). Terminal state is a property of the durable effect identity,
+        # not of the event that happens to carry it, so it must be evaluated before
+        # any projection-dependent branching.
+        if current_status in {STATE_DELIVERED, STATE_MEDIA_FAILED}:
+            self.logger.info(
+                "Suppressing replay of terminal effect %s (state=%s event_type=%s)",
+                effect_id,
+                current_status,
+                event_type,
+            )
             return
         if current_status in {STATE_RESERVED, STATE_UNCERTAIN}:
             self.logger.warning(
@@ -939,8 +954,21 @@ class LinuxWeChatChannel(SlaveChannel):
                 BLOCKED_UNCERTAIN_EFFECT,
             )
             return
-        if current_status == STATE_MEDIA_FAILED:
-            self.logger.warning("Suppressing permanently failed media effect %s", effect_id)
+        # Defect R14-EFB-R2: an update for an identity this consumer never established
+        # is a re-projection of an object that was never delivered to the master — for
+        # example a message created before the governed bootstrap window and re-emitted
+        # above the checkpoint by a Core re-projection pass. Core emits
+        # ``message.created`` for a first projection and ``message.updated`` only for an
+        # object it already holds, so an update must never become a first delivery.
+        # Nothing is written: the decision is a pure function of the durable effect
+        # identity, so a repeated re-projection stays suppressed without polluting the
+        # ledger with synthetic rows.
+        if current_status is None and event_type != "message.created":
+            self.logger.info(
+                "Suppressing projection of unestablished effect %s (event_type=%s)",
+                effect_id or "<no-identity>",
+                event_type,
+            )
             return
 
         chat = self._resolve_core_chat(account_id, chat_id)
@@ -964,7 +992,10 @@ class LinuxWeChatChannel(SlaveChannel):
                 effect_id,
                 details={"chat_id": chat_id, "media_status": "ready"},
             )
-        elif effect_id and (event_type == "message.created" or is_media):
+        elif effect_id:
+            # Reaching this branch means the effect is unestablished and this is a
+            # first projection: every terminal, fail-closed, pending and
+            # unestablished-update combination returned above.
             reserved, reserve_state = self.effect_ledger.reserve_effect(
                 self.consumer_id,
                 effect_id,

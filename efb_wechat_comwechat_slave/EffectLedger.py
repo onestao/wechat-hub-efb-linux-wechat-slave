@@ -46,6 +46,12 @@ STATE_MEDIA_FAILED = "MEDIA_FAILED"
 BLOCKED_UNCERTAIN_EFFECT = "BLOCKED_UNCERTAIN_EFFECT"
 DELIVERY_SEMANTICS = "AT_MOST_ONCE_WITH_FAIL_CLOSED_UNCERTAIN"
 
+#: The external effect kind produced for a WeChat business message. It is the only
+#: kind emitted today; the identity encoding in ``compute_effect_id`` keeps its
+#: historical form so that rows written before ``effect_kind`` existed stay
+#: authoritative and are never orphaned.
+EFFECT_KIND_DELIVERY = "delivery"
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -110,15 +116,48 @@ class EffectLedger:
                 ON effect_ledger(account_id, message_id);
                 """
             )
+            # Additive migration. Every row written before this column existed is a
+            # delivery effect, which is exactly what the default back-fills, so the
+            # historical ledger is preserved verbatim and never rewritten.
+            columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(effect_ledger);").fetchall()
+            }
+            if "effect_kind" not in columns:
+                conn.execute(
+                    "ALTER TABLE effect_ledger "
+                    f"ADD COLUMN effect_kind TEXT NOT NULL DEFAULT '{EFFECT_KIND_DELIVERY}';"
+                )
 
     @staticmethod
-    def compute_effect_id(account_id: str, message_id: str, event_type: str = "message.created") -> str:
-        """Compute the stable effect key from account_id and message_id."""
+    def compute_effect_id(
+        account_id: str,
+        message_id: str,
+        effect_kind: str = EFFECT_KIND_DELIVERY,
+    ) -> str:
+        """Compute the stable external-effect key for a business message.
+
+        The key is deliberately independent of the Core event cursor, of the Core
+        event type, and of every projection payload field. A Core re-projection of the
+        same business message must resolve to the same key, otherwise a replay can
+        never be deduplicated; and a genuinely first-seen message must resolve to a
+        key with no prior row. Both properties follow from keying on
+        (account, message) alone.
+
+        ``effect_kind`` exists so that a second, genuinely independent external effect
+        for the same business message can be addressed *explicitly* rather than being
+        inferred from the event type. ``delivery`` is the only kind produced today and
+        keeps the historical ``{account_id}:{message_id}`` encoding, so ledger rows
+        written before this parameter existed remain valid.
+        """
         acc = str(account_id or "").strip()
         msg = str(message_id or "").strip()
         if not acc or not msg:
             raise ValueError(f"account_id and message_id are required: account={acc!r}, message={msg!r}")
-        return f"{acc}:{msg}"
+        kind = str(effect_kind or "").strip() or EFFECT_KIND_DELIVERY
+        if kind == EFFECT_KIND_DELIVERY:
+            return f"{acc}:{msg}"
+        return f"{acc}:{msg}:{kind}"
 
     def checkpoint_wal(self) -> None:
         """Consolidate the SQLite WAL into the main database file.
@@ -640,6 +679,7 @@ class EffectLedger:
                 "message_id": row["message_id"],
                 "efb_uid": row["efb_uid"],
                 "event_type": row["event_type"],
+                "effect_kind": str(row["effect_kind"] or EFFECT_KIND_DELIVERY),
                 "status": row["status"],
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],

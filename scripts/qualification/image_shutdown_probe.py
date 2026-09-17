@@ -71,7 +71,13 @@ def _handler_type(state: CoreState):
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
             path = urlparse(self.path).path
             if path == "/health":
-                self._send(200, {"status": "ok", "contract_version": "v1"})
+                # The stub must satisfy the product contract exactly:
+                # ``Core.py`` compares ``contract_version`` against the integer
+                # ``CONTRACT_VERSION = 1``. This literal was previously the string
+                # "v1", which made the stub fail the slave's own contract check and
+                # aborted the exact-digest shutdown gate before it could measure
+                # anything. Qualification tooling only -- no product code involved.
+                self._send(200, {"status": "ok", "contract_version": 1})
                 return
             if path.startswith("/v1/consumers/") and path.endswith("/bootstrap"):
                 consumer = unquote(path[len("/v1/consumers/") : -len("/bootstrap")]).rstrip("/")
