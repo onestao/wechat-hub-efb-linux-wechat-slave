@@ -17,6 +17,20 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 CONTRACT_VERSION = 1
 MAX_INLINE_MEDIA_BYTES = 20 * 1024 * 1024
+# Governed bootstrap provenance for Mock Core.
+#
+# Core Interface Contract V1 exposes ``GET /v1/consumers/{consumer_id}/bootstrap``
+# and the unknown-identity hardening classifies any event whose durable effect
+# identity is not yet in the ledger against that subscription floor. Mock Core
+# models a *fresh* consumer: its stream head was 0 when the consumer bootstrapped
+# and every retained fixture event (cursor 1..3, created 2026-08-31) was produced
+# afterwards, so the whole retained stream is new business for it.
+#
+# Without this anchor the provenance read would 404 and every unknown identity
+# would correctly fail closed — i.e. deliver nothing at all.
+BOOTSTRAP_AT = "2026-01-01T00:00:00Z"
+BOOTSTRAP_MODE = "at_head"
+BOOTSTRAP_SOURCE = "governed_bootstrap"
 SAMPLE_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 )
@@ -243,6 +257,28 @@ class MockCoreState:
             if chat["chat_id"] == chat_id:
                 return chat
         raise ApiError(404, "chat_not_found", f"Unknown chat_id for {account_id}: {chat_id}")
+
+    def stream_head_cursor(self) -> int:
+        with self.lock:
+            return max((int(event["cursor"]) for event in self.events), default=0)
+
+    def bootstrap_provenance(self, consumer_id: str) -> dict[str, Any]:
+        """Answer the governed-bootstrap read the unknown-identity hardening needs.
+
+        ``initial_cursor`` is 0 — the stream head at bootstrap — so every retained
+        fixture event is at or after this consumer's floor and models new business
+        rather than a re-projection of a pre-existing object.
+        """
+        with self.lock:
+            return {
+                "ok": True,
+                "consumer_id": consumer_id,
+                "initial_cursor": 0,
+                "bootstrap_mode": BOOTSTRAP_MODE,
+                "bootstrap_source": BOOTSTRAP_SOURCE,
+                "bootstrap_at": BOOTSTRAP_AT,
+                "stream_head_cursor": self.stream_head_cursor(),
+            }
 
     def runtime_accounts(self) -> dict[str, Any]:
         with self.lock:
@@ -577,6 +613,13 @@ class MockCoreHandler(BaseHTTPRequestHandler):
                 return
             if path == "/v1/accounts":
                 self._json(200, {"accounts": self.state.accounts})
+                return
+            consumer_prefix = "/v1/consumers/"
+            if path.startswith(consumer_prefix) and path.endswith("/bootstrap"):
+                consumer_id = unquote(path[len(consumer_prefix) : -len("/bootstrap")].strip("/"))
+                if not consumer_id:
+                    raise ApiError(400, "invalid_request", "consumer_id is required")
+                self._json(200, self.state.bootstrap_provenance(consumer_id))
                 return
             if path == "/v1/runtime/accounts":
                 self._json(200, self.state.runtime_accounts())
