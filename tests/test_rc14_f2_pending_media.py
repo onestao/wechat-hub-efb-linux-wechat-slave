@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import sys
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -208,21 +209,54 @@ class F2PendingMediaStateMachineTest(unittest.TestCase):
         self.assertEqual(1, len(self.deliveries))
         self.assertEqual(STATE_DELIVERED, self._effect_status())
 
-    def test_f2_4_media_never_ready_fails_deterministically(self) -> None:
+    def test_f2_4_media_never_ready_parks_as_recoverable(self) -> None:
+        """DELIBERATE CONTRACT CHANGE -- defect R14-EFB-MISSING-MEDIA-TERMINAL.
+
+        This test previously asserted that exhausting the retry budget produced a
+        terminal ``MEDIA_FAILED``. That assertion *was* the defect: Core materialises
+        media asynchronously, so "not ready yet" was being recorded as "never", which
+        permanently closed the recovery path and made every later authoritative update
+        for the object a ``SUPPRESSED_TERMINAL`` no-op. The expectation is inverted on
+        purpose: the effect is parked as recoverable and stays non-terminal.
+        """
         self.channel.stop_polling()
         self.channel = self._channel(max_attempts=2)
         self.channel._handle_event(self._created_event())
 
         self.channel._retry_pending_media()
 
-        self.assertEqual(STATE_MEDIA_FAILED, self._effect_status())
+        self.assertEqual(STATE_PENDING_MEDIA, self._effect_status())
         self.assertEqual([], self.deliveries)
         effect = self.channel.effect_ledger.get_effect(
             self.channel.consumer_id,
             "account-1:sticker-1",
         )
         self.assertEqual(2, effect["details"]["attempt_count"])
-        self.assertIn("retry exhausted", effect["details"]["media_failure_reason"])
+        self.assertIn("retry exhausted", effect["details"]["parked_reason"])
+        self.assertIs(True, effect["details"]["retry_parked"])
+        # Nothing was terminalised, so the historical terminal count is untouched.
+        self.assertEqual(
+            0,
+            self.channel.effect_ledger.count_effects(
+                self.channel.consumer_id, status=STATE_MEDIA_FAILED
+            ),
+        )
+
+        # The parked effect is gone from the *scheduled* view even for a deadline far
+        # beyond its (deliberately far-future) next_retry_at -- proving the durable
+        # flag, not just the timestamp, is what stops the busy retry.
+        self.assertEqual(
+            [],
+            self.channel.effect_ledger.pending_media(
+                self.channel.consumer_id, due_before=time.time() + 10**9
+            ),
+        )
+
+        # ...yet an authoritative media.ready still recovers it, exactly once.
+        self.core.ready = True
+        self.channel._handle_event(self._ready_event())
+        self.assertEqual(STATE_DELIVERED, self._effect_status())
+        self.assertEqual(1, len(self.deliveries))
 
     def test_f2_5_retries_do_not_duplicate_telegram_delivery(self) -> None:
         self.channel._handle_event(self._created_event())

@@ -1058,23 +1058,39 @@ class LinuxWeChatChannel(SlaveChannel):
                 if attempt_count >= self.media_retry_max_attempts
                 else "media retry deadline exceeded"
             )
-            self.effect_ledger.mark_media_failed(
+            # Defect R14-EFB-MISSING-MEDIA-TERMINAL. Running out of *active* retry
+            # budget is not evidence that the media will never exist. Core publishes
+            # media asynchronously, so a ``missing_file`` / ``original_pending``
+            # observation means "not materialised yet", not "gone". Terminalising here
+            # permanently destroyed the recovery path for every object still in flight
+            # when the budget ran out (12 post-floor objects during the Retry1
+            # preflight), and the resulting terminal row then suppressed every later
+            # authoritative update as SUPPRESSED_TERMINAL.
+            #
+            # The effect is therefore *parked*: active polling stops, but the row stays
+            # PENDING_MEDIA -- non-terminal -- so a later ``media.ready`` or
+            # ``message.updated`` re-activates it and delivers exactly once. Genuinely
+            # unrecoverable media never reaches this branch: it raises
+            # MediaPermanentError and fails closed in ``_fail_media``.
+            self.effect_ledger.mark_media_parked(
                 self.consumer_id,
                 effect_id,
                 account_id=account_id,
                 message_id=message_id,
                 event_type=event_type,
                 reason=reason,
-                details={
-                    "message": dict(message),
-                    "media_id": media_id,
-                    "attempt_count": attempt_count,
-                    "deadline_at": deadline_at,
-                    "last_error": str(error),
-                },
+                attempt_count=attempt_count,
+                media_id=media_id,
+                message=dict(message),
+                last_error=str(error),
             )
-            self.logger.error("Media effect %s failed permanently: %s", effect_id, reason)
-            return STATE_MEDIA_FAILED
+            self.logger.warning(
+                "Parked media effect %s as recoverable after %s; it remains "
+                "PENDING_MEDIA and is retried when Core reports the media available",
+                effect_id,
+                reason,
+            )
+            return STATE_PENDING_MEDIA
         self.logger.info(
             "Deferred media effect %s in %s (attempt=%d next_retry_at=%.3f): %s",
             effect_id,

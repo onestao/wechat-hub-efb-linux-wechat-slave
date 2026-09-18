@@ -32,6 +32,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,6 +46,20 @@ STATE_MEDIA_FAILED = "MEDIA_FAILED"
 
 BLOCKED_UNCERTAIN_EFFECT = "BLOCKED_UNCERTAIN_EFFECT"
 DELIVERY_SEMANTICS = "AT_MOST_ONCE_WITH_FAIL_CLOSED_UNCERTAIN"
+
+#: Durable marker written into ``details_json`` when a media effect has exhausted its
+#: *active* retry budget but must remain recoverable.
+#:
+#: It is deliberately a detail flag rather than a new ``status``: the effect stays
+#: ``PENDING_MEDIA``, which is non-terminal, so the existing reservation path
+#: (``reserve_pending_effect``) and the exactly-once ledger continue to govern it and
+#: no schema migration is required. ``pending_media()`` skips parked rows for
+#: *scheduled* retries but still returns them for an authoritative ``media.ready``.
+DETAIL_RETRY_PARKED = "retry_parked"
+
+#: Defence in depth for parked rows: a far-future ``next_retry_at`` so that even a
+#: reader which ignores ``DETAIL_RETRY_PARKED`` cannot busy-retry them.
+PARKED_RETRY_BACKOFF_SEC = 365 * 24 * 3600.0
 
 #: The external effect kind produced for a WeChat business message. It is the only
 #: kind emitted today; the identity encoding in ``compute_effect_id`` keeps its
@@ -282,6 +297,99 @@ class EffectLedger:
                     "next_retry_at": float(next_retry_at),
                     "deadline_at": float(deadline_at),
                     "last_error": str(last_error or ""),
+                    # A fresh observation re-arms the active retry window: whatever
+                    # parked this effect earlier no longer applies to this attempt.
+                    DETAIL_RETRY_PARKED: False,
+                }
+            )
+            details_str = json.dumps(details, ensure_ascii=False)
+
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO effect_ledger (
+                        consumer_id, effect_id, account_id, message_id,
+                        efb_uid, event_type, status, created_at, updated_at, details_json
+                    ) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?)
+                    """,
+                    (cid, eid, acc, mid, event_type, STATE_PENDING_MEDIA, now, now, details_str),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE effect_ledger
+                    SET event_type = ?, updated_at = ?, details_json = ?
+                    WHERE consumer_id = ? AND effect_id = ? AND status = ?
+                    """,
+                    (event_type, now, details_str, cid, eid, STATE_PENDING_MEDIA),
+                )
+            return True
+
+    def mark_media_parked(
+        self,
+        consumer_id: str,
+        effect_id: str,
+        *,
+        account_id: str,
+        message_id: str,
+        event_type: str,
+        reason: str,
+        attempt_count: int,
+        media_id: str,
+        message: Mapping[str, Any],
+        last_error: str,
+    ) -> bool:
+        """Stop actively retrying a media effect **without** terminalising it.
+
+        Defect R14-EFB-MISSING-MEDIA-TERMINAL. Exhausting the active retry budget is
+        not evidence that the media will never exist: Core materialises media
+        asynchronously, so a ``missing_file`` / ``original_pending`` observation means
+        "not yet", not "never". Terminalising here permanently destroyed the recovery
+        path for every object still in flight when the budget ran out.
+
+        The row keeps ``status = PENDING_MEDIA`` -- non-terminal, and therefore still
+        acceptable to :meth:`reserve_pending_effect` -- and gains a durable
+        ``retry_parked`` marker, so:
+
+        * :meth:`pending_media` stops returning it for *scheduled* retries, so the
+          exhausted budget survives a restart and never re-arms from zero;
+        * it is still returned when ``due_before is None``, which is exactly how an
+          authoritative ``media.ready`` re-activates the effect.
+
+        Returns ``False`` when the effect is not in ``PENDING_MEDIA`` (already
+        delivered, or already failed closed), so a terminal row is never resurrected.
+        """
+        cid = str(consumer_id or "").strip()
+        eid = str(effect_id or "").strip()
+        acc = str(account_id or "").strip()
+        mid = str(message_id or "").strip()
+        now = _utc_now_iso()
+
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT status, details_json FROM effect_ledger WHERE consumer_id = ? AND effect_id = ?",
+                (cid, eid),
+            ).fetchone()
+            if row is not None and str(row["status"]) != STATE_PENDING_MEDIA:
+                return False
+
+            details: Dict[str, Any] = {}
+            if row is not None:
+                try:
+                    details.update(json.loads(row["details_json"] or "{}"))
+                except Exception:
+                    pass
+            details.update(
+                {
+                    "pending_media": True,
+                    "message": dict(message),
+                    "media_id": str(media_id or ""),
+                    "attempt_count": int(attempt_count),
+                    "next_retry_at": time.time() + PARKED_RETRY_BACKOFF_SEC,
+                    "last_error": str(last_error or ""),
+                    DETAIL_RETRY_PARKED: True,
+                    "parked_at": now,
+                    "parked_reason": str(reason or "media retry budget exhausted"),
                 }
             )
             details_str = json.dumps(details, ensure_ascii=False)
@@ -413,7 +521,15 @@ class EffectLedger:
         due_before: Optional[float] = None,
         media_id: str = "",
     ) -> List[Dict[str, Any]]:
-        """Return durable pending rows, optionally filtered by retry time and media id."""
+        """Return durable pending rows, optionally filtered by retry time and media id.
+
+        ``due_before`` selects the *scheduled* retry view. When it is supplied, rows
+        parked by :meth:`mark_media_parked` are excluded: their active budget is
+        exhausted and only an authoritative signal may wake them. When it is ``None``
+        (the ``media.ready`` reactivation path) parked rows are returned like any
+        other pending row, because that is precisely the signal that re-activates
+        them.
+        """
         cid = str(consumer_id or "").strip()
         with self._connection() as conn:
             rows = conn.execute(
@@ -429,6 +545,8 @@ class EffectLedger:
             if media_id and str(details.get("media_id") or "") != str(media_id):
                 continue
             if due_before is not None:
+                if details.get(DETAIL_RETRY_PARKED):
+                    continue
                 try:
                     next_retry_at = float(details.get("next_retry_at") or 0.0)
                 except (TypeError, ValueError):
@@ -699,6 +817,30 @@ class EffectLedger:
                 params.append(str(status).strip())
             row = conn.execute(query, params).fetchone()
             return int(row[0] if row else 0)
+
+    def count_parked_media(self, consumer_id: str = "") -> int:
+        """Read-only count of media effects parked as recoverable-but-not-active.
+
+        These rows are ``PENDING_MEDIA`` (non-terminal) whose *active* retry budget is
+        exhausted. Qualification evidence uses this to tell "still being retried"
+        apart from "waiting for an authoritative ``media.ready``". Never mutates.
+        """
+        params: List[Any] = [STATE_PENDING_MEDIA]
+        query = "SELECT details_json FROM effect_ledger WHERE status = ?"
+        if consumer_id:
+            query += " AND consumer_id = ?"
+            params.append(str(consumer_id).strip())
+        with self._connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        count = 0
+        for row in rows:
+            try:
+                details = json.loads(row["details_json"] or "{}")
+            except Exception:
+                details = {}
+            if details.get(DETAIL_RETRY_PARKED):
+                count += 1
+        return count
 
     def close(self) -> None:
         """Cleanly close ledger resources."""

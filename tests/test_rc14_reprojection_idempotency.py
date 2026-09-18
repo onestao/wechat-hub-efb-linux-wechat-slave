@@ -445,13 +445,33 @@ class TestSingleMessageIdempotency(ReprojectionTestBase):
         self.assertEqual(1, self._row_count())
 
     def test_r4_historical_media_failed_is_not_reopened(self) -> None:
+        """TERMINAL_EFFECT_REOPENED = 0.
+
+        DELIBERATE CONTRACT CHANGE -- defect R14-EFB-MISSING-MEDIA-TERMINAL. This test
+        used to *manufacture* its terminal row by running with ``max_attempts=1`` and
+        letting the media retry budget exhaust on the first attempt, because budget
+        exhaustion was the only way the channel produced ``MEDIA_FAILED``. Exhaustion
+        no longer terminalises (that behaviour was the defect), so the row is seeded
+        directly instead. That is what the test name always claimed, and it is strictly
+        closer to production, where the 42 ``MEDIA_FAILED`` rows were already terminal
+        before this consumer ever started.
+        """
         self.channel.stop_polling()
         self.channel = self._new_channel(max_attempts=1, media_ready=False)
         self.channel._deliver_message = self._capture
         self._register_chat("f-live-a", "38808757431@chatroom")
 
         message = self._media_msg("r4-img", status="original_pending")
-        self.channel._handle_event(self._event("message.created", message))
+        effect_id = self.channel.effect_ledger.compute_effect_id("f-live-a", "r4-img")
+        # Seed the pre-existing terminal row, as the production ledger already holds 42 of.
+        self.channel.effect_ledger.mark_media_failed(
+            self.channel.consumer_id,
+            effect_id,
+            account_id="f-live-a",
+            message_id="r4-img",
+            event_type="message.created",
+            reason="historical terminal row, predating this consumer",
+        )
         self.assertEqual(STATE_MEDIA_FAILED, self._status("f-live-a", "r4-img"))
         self.assertEqual([], self.deliveries)
         self.assertEqual(1, self._row_count())
@@ -462,6 +482,31 @@ class TestSingleMessageIdempotency(ReprojectionTestBase):
 
         self.assertEqual(STATE_MEDIA_FAILED, self._status("f-live-a", "r4-img"))
         self.assertEqual(1, self._row_count(), "no duplicate terminal row")
+        self.assertEqual([], self.deliveries)
+
+        # A later authoritative media.ready must not wake a terminal effect either.
+        self.core.media_ready = True
+        self.channel._handle_event(
+            {
+                "event_type": "media.ready",
+                "account_id": "f-live-a",
+                "payload": {
+                    "media": {
+                        "media_id": "r4-img-media",
+                        "role": "original",
+                        "status": "ready",
+                    }
+                },
+            }
+        )
+        self.channel._retry_pending_media()
+
+        self.assertEqual(
+            STATE_MEDIA_FAILED,
+            self._status("f-live-a", "r4-img"),
+            "a historical terminal row must never be reopened",
+        )
+        self.assertEqual(1, self._row_count())
         self.assertEqual([], self.deliveries)
 
     def test_r5_pending_media_progresses_to_exactly_one_delivery(self) -> None:
