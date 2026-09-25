@@ -17,7 +17,7 @@ from ehforwarderbot.message import LinkAttribute, LocationAttribute, Substitutio
 from ehforwarderbot.types import MessageID
 
 from .ChatMgr import ChatMgr
-from .Core import CoreAPIError, CoreClient
+from .Core import CoreAPIError, CoreClient, CoreUnavailableError
 
 
 class MediaSelectionError(RuntimeError):
@@ -30,6 +30,43 @@ class MediaPendingError(MediaSelectionError):
 
 class MediaPermanentError(MediaSelectionError):
     """The original media artifact failed permanently and must not fall back."""
+
+
+#: HTTP statuses that mean "the upstream could not serve this right now" rather
+#: than "this object will never be servable": the retry budget must own them.
+#: 408/425/429 are the IANA transient client-facing statuses and every 5xx is a
+#: server-side failure, including Core's ``504 agent_wechat_error``.
+_TRANSIENT_MEDIA_STATUSES = frozenset({408, 425, 429})
+
+
+def _is_transient_media_error(exc: CoreAPIError) -> bool:
+    """Whether a structured Core media error is recoverable on a later attempt.
+
+    Defect R14-EFB-MEDIA-RETRY-HEAD-OF-LINE. ``_media_file`` used to convert only
+    ``404 media_not_found`` into :class:`MediaPendingError` and re-raise everything
+    else verbatim. ``ComWechat._handle_message_event`` catches only
+    ``MediaPendingError`` / ``MediaPermanentError``, so a transient upstream
+    failure such as ``504 agent_wechat_error: CDN download failed`` escaped
+    ``_retry_pending_media`` -> ``poll_once`` and aborted the whole polling
+    iteration *before* any new event was fetched. One unservable sticker therefore
+    blocked every later text and media message, the cursor stopped advancing, and
+    the attempt counter was never incremented, so the existing backoff and
+    recoverable-park machinery never engaged.
+
+    Classification is deliberately explicit and fail-closed:
+
+    * transient (``202 media_pending``, 408/425/429, every 5xx) -> retryable;
+    * ``404 media_unsupported`` -> the upstream already gave a final verdict;
+    * every other status (401/403, unknown 4xx, ``404 account_not_found``, ...) is
+      *not* a media-readiness statement and keeps propagating unchanged, so it
+      still fails closed instead of being disguised as a retryable media error.
+    """
+    status = int(exc.status_code)
+    if status == 202 and exc.code == "media_pending":
+        return True
+    if status in _TRANSIENT_MEDIA_STATUSES:
+        return True
+    return 500 <= status < 600
 
 
 class CoreMessageBuilder:
@@ -46,9 +83,26 @@ class CoreMessageBuilder:
     ) -> Tuple[Any, str, str, Path]:
         try:
             media = self.core.get_media(account_id, media_id)
+        except CoreUnavailableError as exc:
+            # Core unreachable / non-protocol answer: the media may well be
+            # servable later, so this is a retryable media observation, never a
+            # reason to abandon the polling iteration.
+            raise MediaPendingError(
+                f"Core media endpoint is unavailable for {media_id}: {exc}"
+            ) from exc
         except CoreAPIError as exc:
             if exc.status_code == 404 and exc.code == "media_not_found":
                 raise MediaPendingError(f"Core media bytes are not ready for {media_id}") from exc
+            if exc.status_code == 404 and exc.code == "media_unsupported":
+                # The upstream stated a final verdict for this object. Terminal,
+                # so it leaves the retry set instead of blocking it forever.
+                raise MediaPermanentError(
+                    f"Core reports media {media_id} as unsupported by the upstream"
+                ) from exc
+            if _is_transient_media_error(exc):
+                raise MediaPendingError(
+                    f"Core media fetch for {media_id} failed transiently: {exc}"
+                ) from exc
             raise
         if media.role != "original":
             raise MediaPermanentError(
