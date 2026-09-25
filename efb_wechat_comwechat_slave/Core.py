@@ -313,6 +313,27 @@ class CoreClient:
     def get_media(self, account_id: str, media_id: str) -> CoreMedia:
         path = f"/v1/media/{quote(media_id, safe='')}"
         response = self._request("GET", path, params={"account_id": account_id})
+        if response.status_code == 202:
+            # Defect R14-EFB-MEDIA-PENDING-AS-TERMINAL. Core answers
+            # ``202 media_pending`` while the WeChat client is still downloading the
+            # object. ``202`` is a 2xx status, so ``_request`` returns it as a
+            # *success* and the JSON error body was handed back as if it were media
+            # bytes. With no ``X-Media-Role`` header the role check in
+            # ``CoreMessage._media_file`` then raised ``MediaPermanentError`` and
+            # ``ComWechat._fail_media`` wrote a terminal ``MEDIA_FAILED`` row for
+            # media that Core explicitly says is still coming -- the same
+            # "not materialised yet recorded as never" class as
+            # R14-EFB-MISSING-MEDIA-TERMINAL.
+            #
+            # Surfacing it as the structured ``202 media_pending`` Core error is
+            # what makes the documented retryable classification in
+            # ``CoreMessage._is_transient_media_error`` reachable, so the object is
+            # deferred with backoff and parks recoverably instead of failing closed.
+            raise CoreAPIError(
+                202,
+                "media_pending",
+                "Media content is still downloading in the WeChat client",
+            )
         content_type = response.headers.get("Content-Type", "application/octet-stream").split(";", 1)[0].strip()
         disposition = response.headers.get("Content-Disposition", "")
         filename: Optional[str] = None

@@ -58,6 +58,7 @@ from ehforwarderbot import MsgType
 from efb_wechat_comwechat_slave.ComWechat import LinuxWeChatChannel
 from efb_wechat_comwechat_slave.Core import (
     CoreAPIError,
+    CoreClient,
     CoreMedia,
     CoreUnavailableError,
 )
@@ -604,6 +605,134 @@ class MediaRetryRecoveryTest(unittest.TestCase):
         self.assertEqual(STATE_DELIVERED, self._status("sticker-1"))
         self.assertEqual(1, len(self.deliveries))
         self.assertEqual(0, self._media_failed_count())
+
+
+class _FakeResponse:
+    """Minimal ``requests.Response`` double for the media boundary."""
+
+    def __init__(self, status_code: int, headers: dict, body: bytes) -> None:
+        self.status_code = status_code
+        self.headers = dict(headers)
+        self.content = body
+
+    @property
+    def ok(self) -> bool:
+        return self.status_code < 400
+
+    def json(self):
+        import json as _json
+
+        return _json.loads(self.content.decode("utf-8"))
+
+
+class _FakeSession:
+    """Returns one scripted response for every request."""
+
+    def __init__(self, response: _FakeResponse) -> None:
+        self.response = response
+        self.requests: list = []
+
+    def request(self, method, url, **kwargs):
+        self.requests.append((method, url, kwargs))
+        return self.response
+
+
+#: The exact body Core returns for ``202 media_pending`` (app.py:1041).
+CORE_202_BODY = (
+    b'{"error":{"code":"media_pending","message":"Media content is still downloading '
+    b'in WeChat client","details":{"media_id":"m-1"}}}'
+)
+
+
+class CoreClientMediaBoundaryTest(unittest.TestCase):
+    """Defect R14-EFB-MEDIA-PENDING-AS-TERMINAL.
+
+    ``202`` is a 2xx status, so ``CoreClient._request`` returns it as a success and
+    the JSON error body used to be handed to ``CoreMessage._media_file`` as if it
+    were media bytes. With no ``X-Media-Role`` header the role check raised
+    ``MediaPermanentError`` and ``ComWechat._fail_media`` wrote a terminal
+    ``MEDIA_FAILED`` row for media Core explicitly says is still downloading.
+
+    Production evidence (2026-09-25): two effects whose media answered
+    ``HTTP/1.0 202 Accepted`` with ``Content-Type: application/json`` and no
+    ``X-Media-Role`` were terminalised with reason
+    ``Core returned media role '' ...; expected 'original'``. The same reason
+    appears on historical rows from 2026-09-22.
+    """
+
+    def _client(self, response: _FakeResponse) -> tuple[CoreClient, _FakeSession]:
+        session = _FakeSession(response)
+        return CoreClient("http://core.test", session=session), session
+
+    def test_202_media_pending_is_surfaced_as_a_structured_retryable_error(self) -> None:
+        client, session = self._client(
+            _FakeResponse(
+                202,
+                {"Content-Type": "application/json; charset=utf-8", "Content-Length": str(len(CORE_202_BODY))},
+                CORE_202_BODY,
+            )
+        )
+        with self.assertRaises(CoreAPIError) as ctx:
+            client.get_media("account-1", "m-1")
+        self.assertEqual(202, ctx.exception.status_code)
+        self.assertEqual("media_pending", ctx.exception.code)
+        self.assertEqual(1, len(session.requests))
+
+    def test_202_classification_makes_the_media_file_path_pending_not_permanent(self) -> None:
+        """The surfaced 202 must land in ``MediaPendingError``, never permanent."""
+        client, _session = self._client(
+            _FakeResponse(202, {"Content-Type": "application/json"}, CORE_202_BODY)
+        )
+        from efb_wechat_comwechat_slave.ChatMgr import ChatMgr
+        from efb_wechat_comwechat_slave.CoreMessage import CoreMessageBuilder
+
+        channel = LinuxWeChatChannel.__new__(LinuxWeChatChannel)
+        builder = CoreMessageBuilder(client, ChatMgr(channel))
+        with self.assertRaises(MediaPendingError) as ctx:
+            builder._media_file("account-1", "m-1", "sticker.webp", "image/webp")
+        self.assertNotIsInstance(ctx.exception, MediaPermanentError)
+
+    def test_200_ready_media_is_still_served_normally(self) -> None:
+        body = b"REAL-WEBP-BYTES"
+        client, _session = self._client(
+            _FakeResponse(
+                200,
+                {
+                    "Content-Type": "image/webp",
+                    "Content-Disposition": 'inline; filename="sticker.webp"',
+                    "X-Media-Id": "m-1",
+                    "X-Media-Role": "original",
+                    "X-Media-Status": "ready",
+                },
+                body,
+            )
+        )
+        media = client.get_media("account-1", "m-1")
+        self.assertEqual(body, media.content)
+        self.assertEqual("original", media.role)
+        self.assertEqual("ready", media.status)
+        self.assertEqual("sticker.webp", media.filename)
+        self.assertEqual("image/webp", media.mime_type)
+
+    def test_non_2xx_media_errors_still_raise_structured_errors(self) -> None:
+        body = b'{"error":{"code":"agent_wechat_error","message":"CDN download failed"}}'
+        client, _session = self._client(
+            _FakeResponse(504, {"Content-Type": "application/json"}, body)
+        )
+        with self.assertRaises(CoreAPIError) as ctx:
+            client.get_media("account-1", "m-1")
+        self.assertEqual(504, ctx.exception.status_code)
+        self.assertEqual("agent_wechat_error", ctx.exception.code)
+
+    def test_404_media_unsupported_still_raises_the_unsupported_code(self) -> None:
+        body = b'{"error":{"code":"media_unsupported","message":"Media format is unsupported"}}'
+        client, _session = self._client(
+            _FakeResponse(404, {"Content-Type": "application/json"}, body)
+        )
+        with self.assertRaises(CoreAPIError) as ctx:
+            client.get_media("account-1", "m-1")
+        self.assertEqual(404, ctx.exception.status_code)
+        self.assertEqual("media_unsupported", ctx.exception.code)
 
 
 if __name__ == "__main__":
